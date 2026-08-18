@@ -7,7 +7,6 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include "amdgpu_mpu_uapi.h"
 #include "device/accelerator_registry.h"
 
 namespace mooncake {
@@ -65,9 +64,42 @@ bool MemoryPoolStorageBackend::LooksLikeDevicePointer(const void* ptr) const {
     return r.FindDeviceForPointer(const_cast<void*>(ptr), &info) != nullptr;
 }
 
+tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferGpuToGpu(
+    const Slice& src, const Slice& dst, uint32_t path) {
+    if (!LooksLikeDevicePointer(src.ptr) || !LooksLikeDevicePointer(dst.ptr))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    if (!src.size || !dst.size || src.size != dst.size)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    amdgpu_mpu::IoctlXfer req{};
+    req.src_addr = reinterpret_cast<uint64_t>(src.ptr);
+    req.dst_addr = reinterpret_cast<uint64_t>(dst.ptr);
+    req.length = src.size;
+    req.path = path;
+    req.flags = amdgpu_mpu::kXferSignal | amdgpu_mpu::kXferOrdered;
+    req.fence_fd = -1;
+    if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_XFER, &req) < 0)
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (req.cookie) {
+        amdgpu_mpu::IoctlWait wait{req.cookie, kTimeoutNs, 0, 0};
+        if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_WAIT, &wait) < 0 || wait.status)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferPToD(
+    const Slice& src, const Slice& dst) {
+    return TransferGpuToGpu(src, dst, amdgpu_mpu::kPathPToD);
+}
+
+tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferDToP(
+    const Slice& src, const Slice& dst) {
+    return TransferGpuToGpu(src, dst, amdgpu_mpu::kPathDToP);
+}
+
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Transfer(
     const Slice& slice, const Allocation& a, uint64_t offset, bool to_pool) {
-    if (!LooksLikeDevicePointer(slice.ptr))
+    if (!LooksLikeDevicePointer(slice.ptr) || offset + slice.size > a.size)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     amdgpu_mpu::IoctlXfer req{};
     req.src_addr = to_pool ? reinterpret_cast<uint64_t>(slice.ptr) : a.global_addr + offset;
@@ -84,6 +116,16 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Transfer(
             return tl::make_unexpected(to_pool ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL);
     }
     return {};
+}
+
+tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferDToPool(
+    const Slice& src, uint64_t handle, uint64_t addr, uint64_t offset) {
+    return Transfer(src, Allocation{handle, addr, offset + src.size}, offset, true);
+}
+
+tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferPoolToD(
+    const Slice& dst, uint64_t handle, uint64_t addr, uint64_t offset) {
+    return Transfer(dst, Allocation{handle, addr, offset + dst.size}, offset, false);
 }
 
 tl::expected<void*, ErrorCode> MemoryPoolStorageBackend::MapAllocation(const Allocation&) {
@@ -115,8 +157,7 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::EvictForSpace(
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Init() {
     bool expected = false;
-    if (!initialized_.compare_exchange_strong(expected, true))
-        return {};
+    if (!initialized_.compare_exchange_strong(expected, true)) return {};
     auto r = OpenDevice();
     if (!r) initialized_.store(false);
     return r;
@@ -136,12 +177,9 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         if (!total) continue;
         auto a = Allocate(total); if (!a) continue;
         uint64_t off = 0; bool ok = true;
-        for (const auto& s : slices) { auto r = Transfer(s, a.value(), off, true); if (!r) { ok = false; break; } off += s.size; }
+        for (const auto& s : slices) { auto r = TransferDToPool(s, a.value().handle, a.value().global_addr, off); if (!r) { ok = false; break; } off += s.size; }
         if (!ok) { Free(a.value()); continue; }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            entries_[key] = Entry{a.value(), next_sequence_++};
-        }
+        { std::lock_guard<std::mutex> lock(mutex_); entries_[key] = Entry{a.value(), next_sequence_++}; }
         used_bytes_ += a.value().size;
         keys.push_back(key);
         meta.push_back(StorageObjectMetadata{0, static_cast<int64_t>(a.value().global_addr), 0, static_cast<int64_t>(total), ""});
@@ -156,7 +194,7 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::BatchLoad(
     for (auto& [key, dst] : objects) {
         Entry e; { std::lock_guard<std::mutex> lock(mutex_); auto it = entries_.find(key); if (it == entries_.end()) return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND); e = it->second; }
         if (dst.size > e.allocation.size) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        auto r = Transfer(dst, e.allocation, 0, false); if (!r) return r;
+        auto r = TransferPoolToD(dst, e.allocation.handle, e.allocation.global_addr, 0); if (!r) return r;
     }
     return {};
 }
