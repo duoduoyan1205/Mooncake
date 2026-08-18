@@ -2,30 +2,27 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "amdgpu_mpu_uapi.h"
+#include "memory_pool_transfer_engine.h"
 #include "storage_backend.h"
 
 namespace mooncake {
 
 enum class MemoryPoolAccessPath : uint32_t {
-    kPToD = amdgpu_mpu::kPathPToD,
-    kDToP = amdgpu_mpu::kPathDToP,
-    kDToPool = amdgpu_mpu::kPathDToPoolWrite,
-    kPoolToD = amdgpu_mpu::kPathDToPoolRead,
+    kPToD = 0,
+    kDToP = 1,
+    kDToPool = 2,
+    kPoolToD = 3,
 };
 
 class MemoryPoolStorageBackend final : public StorageBackendInterface {
  public:
-    struct Allocation {
-        uint64_t handle = 0;
-        uint64_t global_addr = 0;
-        uint64_t size = 0;
-    };
+    using Allocation = MemoryPoolTransferEngine::Allocation;
 
     explicit MemoryPoolStorageBackend(const FileStorageConfig& config);
     ~MemoryPoolStorageBackend() override;
@@ -69,8 +66,6 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
         bool local_owner = true;
     };
 
-    tl::expected<void, ErrorCode> OpenDevice();
-    void CloseDevice();
     tl::expected<Allocation, ErrorCode> Allocate(uint64_t size);
     tl::expected<void, ErrorCode> Free(const Allocation& allocation);
     tl::expected<void, ErrorCode> Transfer(const Slice& slice,
@@ -78,15 +73,12 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
                                            uint64_t offset, bool to_pool);
     tl::expected<void, ErrorCode> TransferGpuToGpu(const Slice& src,
                                                    const Slice& dst,
-                                                   uint32_t path);
+                                                   MemoryPoolAccessPath path);
     bool LooksLikeDevicePointer(const void* ptr) const;
     tl::expected<void, ErrorCode> EvictForSpace(
         uint64_t required_size, EvictionHandler eviction_handler);
 
-    void* sueverbs_handle_ = nullptr;
-    void* sueverbs_ctx_ = nullptr;
-    std::string sueverbs_library_;
-    std::string device_path_;
+    std::unique_ptr<MemoryPoolTransferEngine> transfer_engine_;
     uint64_t capacity_ = 0;
     std::atomic<uint64_t> used_bytes_{0};
     std::atomic<uint64_t> next_sequence_{0};
