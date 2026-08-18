@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -10,7 +11,6 @@
 
 #include "amdgpu_mpu_uapi.h"
 #include "device/accelerator_registry.h"
-#include "environ.h"
 
 namespace mooncake {
 
@@ -22,13 +22,17 @@ uint64_t AlignUp(uint64_t value, uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+std::string GetMemoryPoolDevicePath() {
+    const char* value = std::getenv("MOONCAKE_MEMORY_POOL_DEVICE");
+    return value != nullptr && value[0] != '\0' ? value : "/dev/amdgpu-mpu";
+}
+
 }  // namespace
 
 MemoryPoolStorageBackend::MemoryPoolStorageBackend(
     const FileStorageConfig& config)
     : StorageBackendInterface(config),
-      device_path_(Environ::GetString("MOONCAKE_MEMORY_POOL_DEVICE",
-                                     "/dev/amdgpu-mpu")),
+      device_path_(GetMemoryPoolDevicePath()),
       capacity_(static_cast<uint64_t>(std::max<int64_t>(
           0, config.total_size_limit))) {}
 
@@ -58,8 +62,6 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::OpenDevice() {
                   << ", mem_base=0x" << std::hex << caps.mem_base
                   << ", mem_size=" << std::dec << caps.mem_size;
     } else {
-        // CAPS is a bring-up aid. Keep operating when an older driver does not
-        // implement it; ALLOC/XFER are the required interfaces.
         VLOG(1) << "Memory Pool: CAPS ioctl unavailable: " << strerror(errno);
     }
 
@@ -185,8 +187,6 @@ tl::expected<void*, ErrorCode> MemoryPoolStorageBackend::MapAllocation(
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
-    // The kernel driver uses mmap's page-offset as {handle,page} where the
-    // high 32 bits identify the allocation. Page zero maps the allocation.
     const off_t page_offset = static_cast<off_t>(allocation.handle) << 32;
     void* mapped = mmap(nullptr, allocation.size, PROT_READ | PROT_WRITE,
                         MAP_SHARED, fd_, page_offset << 12);
@@ -319,9 +319,6 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         for (const auto& slice : slices) total += slice.size;
         if (total == 0) continue;
 
-        // Replacing an existing key first releases its old allocation. The
-        // current master protocol treats the write as an overwrite of the
-        // same LOCAL_DISK replica.
         Entry old_entry;
         bool had_old = false;
         {
@@ -345,9 +342,7 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         }
 
         auto alloc_res = Allocate(total);
-        if (!alloc_res) {
-            continue;
-        }
+        if (!alloc_res) continue;
         Allocation allocation = alloc_res.value();
         uint64_t offset = 0;
         bool success = true;
