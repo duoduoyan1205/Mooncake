@@ -549,15 +549,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        // D2H staging: replace device slices with host memory slices
-        // so that storage_backend (ConcatSlicesToString / BuildBucket /
-        // WriteBucket) always receives host pointers.
+        // Memory Pool is a GPU-native backend: preserve device slices so the
+        // backend can submit GPU HBM -> MPU/SUE transfers directly. All
+        // existing disk backends keep the historical D2H staging path.
         std::unordered_map<std::string, std::vector<Slice>> host_batch_object;
         std::vector<PinnedBufferPool::Buffer> staging_bufs;
-        auto runtime_accelerator =
-            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        if (config_.storage_backend_type == StorageBackendType::kMemoryPool) {
+            host_batch_object = batch_object;
+        } else {
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
 
-        for (auto& [obj_key, slices] : batch_object) {
+            for (auto& [obj_key, slices] : batch_object) {
             std::vector<Slice> host_slices;
             bool obj_success = true;
             for (const auto& slice : slices) {
@@ -583,6 +586,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             if (obj_success) {
                 host_batch_object[obj_key] = std::move(host_slices);
+            }
+        }
+
             }
         }
 
