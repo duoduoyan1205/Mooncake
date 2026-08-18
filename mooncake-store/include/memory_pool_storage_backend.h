@@ -20,6 +20,9 @@ enum class MemoryPoolAccessPath : uint32_t {
     kPoolToD = 3,
 };
 
+// Memory Pool is a volatile remote-memory backend.  It reuses the Store's
+// object/key interface, but its physical lifecycle is memory allocation and
+// DMA transfer, not file creation, eviction, or filesystem persistence.
 class MemoryPoolStorageBackend final : public StorageBackendInterface {
  public:
     using Allocation = MemoryPoolTransferEngine::Allocation;
@@ -41,10 +44,8 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
         const std::function<ErrorCode(const std::vector<std::string>&,
                                       std::vector<StorageObjectMetadata>&)>& handler) override;
     void RemoveAll() override;
-    tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
-        double high_watermark_ratio, double low_watermark_ratio,
-        EvictionHandler eviction_handler = nullptr) override;
 
+    // Direct transfer-engine entry points used by the four MPU access paths.
     tl::expected<void, ErrorCode> TransferPToD(const Slice& src, const Slice& dst);
     tl::expected<void, ErrorCode> TransferDToP(const Slice& src, const Slice& dst);
     tl::expected<void, ErrorCode> TransferDToPool(
@@ -52,36 +53,29 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
     tl::expected<void, ErrorCode> TransferPoolToD(
         const Slice& dst, const Allocation& allocation, uint64_t offset = 0);
 
-    tl::expected<void, ErrorCode> RegisterRemoteAllocation(
-        const std::string& key, const Allocation& allocation);
-    tl::expected<void, ErrorCode> UnregisterRemoteAllocation(
-        const std::string& key);
+    // CPU-side allocation metadata lookup.  The Memory Pool itself stores
+    // only KV data; key/hash and allocation descriptors remain in Store DRAM.
     tl::expected<Allocation, ErrorCode> GetAllocation(
         const std::string& key) const;
 
  private:
     struct Entry {
         Allocation allocation;
-        uint64_t sequence = 0;
-        bool local_owner = true;
     };
 
     tl::expected<Allocation, ErrorCode> Allocate(uint64_t size);
     tl::expected<void, ErrorCode> Free(const Allocation& allocation);
     tl::expected<void, ErrorCode> Transfer(const Slice& slice,
-                                           const Allocation& allocation,
-                                           uint64_t offset, bool to_pool);
+                                            const Allocation& allocation,
+                                            uint64_t offset, bool to_pool);
     tl::expected<void, ErrorCode> TransferGpuToGpu(const Slice& src,
-                                                   const Slice& dst,
-                                                   MemoryPoolAccessPath path);
+                                                    const Slice& dst,
+                                                    MemoryPoolAccessPath path);
     bool LooksLikeDevicePointer(const void* ptr) const;
-    tl::expected<void, ErrorCode> EvictForSpace(
-        uint64_t required_size, EvictionHandler eviction_handler);
 
     std::unique_ptr<MemoryPoolTransferEngine> transfer_engine_;
     uint64_t capacity_ = 0;
     std::atomic<uint64_t> used_bytes_{0};
-    std::atomic<uint64_t> next_sequence_{0};
     std::atomic<bool> initialized_{false};
     mutable std::mutex mutex_;
     std::unordered_map<std::string, Entry> entries_;
