@@ -15,8 +15,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
-#include <cstring>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "cuda_alike.h"
@@ -82,9 +82,9 @@ void ExpectPattern(const std::vector<unsigned char>& data, unsigned char value) 
 }
 }  // namespace
 
-// This is an integration test: it intentionally skips when the MPU driver,
-// SUE verbs library, or two GPU devices are not available. On an MPU-capable
-// node it exercises the four data-plane paths exposed by the Transfer Engine:
+// Integration test for an MPU/SUE-capable node. It intentionally skips when
+// the driver, SUE verbs library, or two GPU devices are unavailable. On a
+// real node it exercises all four MPU data-plane paths:
 //   P -> D, D -> P, D -> Memory Pool, Memory Pool -> D.
 TEST(MemoryPoolTransferEngineTest, FourAccessPaths) {
     const std::string device_path =
@@ -92,7 +92,7 @@ TEST(MemoryPoolTransferEngineTest, FourAccessPaths) {
     const std::string sueverbs_library =
         EnvOrDefault("MOONCAKE_SUEVERBS_LIBRARY", "libsueverbs.so");
 
-    if (std::access(device_path.c_str(), R_OK | W_OK) != 0) {
+    if (access(device_path.c_str(), R_OK | W_OK) != 0) {
         GTEST_SKIP() << "MPU device is unavailable: " << device_path;
     }
 
@@ -112,8 +112,8 @@ TEST(MemoryPoolTransferEngineTest, FourAccessPaths) {
     ASSERT_TRUE(engine.IsOpen());
     ASSERT_GT(engine.Capacity(), 0u);
 
-    // P and D are deliberately placed on different GPUs so these tests do not
-    // accidentally reduce to a same-device copy.
+    // P and D deliberately use different GPU devices. This prevents the
+    // direct P/D tests from accidentally becoming same-device copies.
     DeviceBuffer p_buffer(0, kTransferSize);
     DeviceBuffer d_buffer(1, kTransferSize);
 
@@ -139,9 +139,8 @@ TEST(MemoryPoolTransferEngineTest, FourAccessPaths) {
               0);
     ExpectPattern(p_buffer.ReadBack(), kDPattern);
 
-    // Allocate the remote Memory Pool object once and use the same allocation
-    // for both pool directions. The allocation metadata is the global SUE
-    // address returned by the MPU node, not a CPU virtual address.
+    // Allocate one Memory Pool object and use its global SUE address for both
+    // pool directions. No CPU virtual address is used for the pool object.
     MemoryPoolTransferEngine::Allocation pool{};
     ASSERT_EQ(engine.Allocate(kTransferSize, &pool), 0);
     ASSERT_NE(pool.handle, 0u);
