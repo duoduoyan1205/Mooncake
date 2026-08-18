@@ -22,6 +22,11 @@ std::string DevicePath() {
     const char* p = std::getenv("MOONCAKE_MEMORY_POOL_DEVICE");
     return p && *p ? p : "/dev/amdgpu-mpu";
 }
+
+std::string EnvString(const char* name) {
+    const char* value = std::getenv(name);
+    return value ? std::string(value) : std::string();
+}
 }  // namespace
 
 MemoryPoolStorageBackend::MemoryPoolStorageBackend(
@@ -289,6 +294,10 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
 
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadata;
+    const std::string node_id = EnvString("MOONCAKE_MEMORY_POOL_NODE_ID");
+    const std::string endpoint =
+        EnvString("MOONCAKE_MEMORY_POOL_TRANSPORT_ENDPOINT");
+
     for (const auto& [key, slices] : objects) {
         uint64_t total = 0;
         for (const auto& slice : slices) total += slice.size;
@@ -300,8 +309,7 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         uint64_t offset = 0;
         bool ok = true;
         for (const auto& slice : slices) {
-            auto transfer = TransferDToPool(
-                slice, allocation.value(), offset);
+            auto transfer = TransferDToPool(slice, allocation.value(), offset);
             if (!transfer) {
                 ok = false;
                 break;
@@ -321,14 +329,10 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         used_bytes_.fetch_add(allocation.value().size,
                               std::memory_order_relaxed);
         keys.push_back(key);
-        // StorageObjectMetadata has no dedicated Memory Pool fields. Keep the
-        // allocation handle in bucket_id, the global address in offset, and
-        // the object size in data_size. The replica descriptor is the canonical
-        // strongly-typed representation used by MasterClient.
         metadata.push_back(StorageObjectMetadata{
             static_cast<int64_t>(allocation.value().handle),
             static_cast<int64_t>(allocation.value().global_addr), 0,
-            static_cast<int64_t>(total), ""});
+            static_cast<int64_t>(total), endpoint});
     }
 
     if (complete && !keys.empty()) {
@@ -381,6 +385,8 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::ScanMeta(
         std::vector<StorageObjectMetadata>&)>& handler) {
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadata;
+    const std::string endpoint =
+        EnvString("MOONCAKE_MEMORY_POOL_TRANSPORT_ENDPOINT");
     {
         std::lock_guard<std::mutex> lock(mutex_);
         keys.reserve(entries_.size());
@@ -390,7 +396,7 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::ScanMeta(
             metadata.push_back(StorageObjectMetadata{
                 static_cast<int64_t>(entry.allocation.handle),
                 static_cast<int64_t>(entry.allocation.global_addr), 0,
-                static_cast<int64_t>(entry.allocation.size), ""});
+                static_cast<int64_t>(entry.allocation.size), endpoint});
         }
     }
     if (handler && !keys.empty()) {
