@@ -1,15 +1,16 @@
 name: apply-memory-pool-wiring
 
 on:
-  push:
-    branches: [mooncakempu-clean]
+  pull_request:
+    branches: [mpu-patch-base]
+    types: [opened, synchronize]
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: github.event.head_commit.message != 'chore(store): wire memory pool backend'
+    if: github.event.pull_request.head.ref == 'mooncakempu-clean' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,41 +31,19 @@ jobs:
                   raise SystemExit(f'pattern occurs {s.count(old)} times in {path}: {old!r}')
               p.write_text(s.replace(old, new))
 
-          replace_once(
-              'mooncake-store/include/storage_backend.h',
-              '    kDistributed\n};',
-              '    kDistributed,\n    kMemoryPool\n};')
-
-          replace_once(
-              'mooncake-store/include/storage_backend.h',
-              'CreateStorageBackend(const FileStorageConfig& config);',
-              'CreateStorageBackend(const FileStorageConfig& config);\n\ntl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>\nCreateMemoryPoolStorageBackend(const FileStorageConfig& config);')
-
-          replace_once(
-              'mooncake-store/src/file_storage.cpp',
-              '    } else if (storage_backend_descriptor == "distributed_storage_backend") {\n        config.storage_backend_type = StorageBackendType::kDistributed;\n    } else {',
-              '    } else if (storage_backend_descriptor == "distributed_storage_backend") {\n        config.storage_backend_type = StorageBackendType::kDistributed;\n    } else if (storage_backend_descriptor == "memory_pool_storage_backend") {\n        config.storage_backend_type = StorageBackendType::kMemoryPool;\n    } else {')
-
-          replace_once(
-              'mooncake-store/src/storage_backend.cpp',
-              '#include "storage/distributed/distributed_storage_backend.h"',
-              '#include "storage/distributed/distributed_storage_backend.h"\n#include "memory_pool_storage_backend.h"')
-
-          replace_once(
-              'mooncake-store/src/storage_backend.cpp',
-              '        case StorageBackendType::kDistributed: {\n            auto distributed_config =',
-              '        case StorageBackendType::kMemoryPool:\n            return CreateMemoryPoolStorageBackend(config);\n        case StorageBackendType::kDistributed: {\n            auto distributed_config =')
+          replace_once('mooncake-store/include/storage_backend.h', '    kDistributed\n};', '    kDistributed,\n    kMemoryPool\n};')
+          replace_once('mooncake-store/include/storage_backend.h', 'CreateStorageBackend(const FileStorageConfig& config);', 'CreateStorageBackend(const FileStorageConfig& config);\n\ntl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>\nCreateMemoryPoolStorageBackend(const FileStorageConfig& config);')
+          replace_once('mooncake-store/src/file_storage.cpp', '    } else if (storage_backend_descriptor == "distributed_storage_backend") {\n        config.storage_backend_type = StorageBackendType::kDistributed;\n    } else {', '    } else if (storage_backend_descriptor == "distributed_storage_backend") {\n        config.storage_backend_type = StorageBackendType::kDistributed;\n    } else if (storage_backend_descriptor == "memory_pool_storage_backend") {\n        config.storage_backend_type = StorageBackendType::kMemoryPool;\n    } else {')
+          replace_once('mooncake-store/src/storage_backend.cpp', '#include "storage/distributed/distributed_storage_backend.h"', '#include "storage/distributed/distributed_storage_backend.h"\n#include "memory_pool_storage_backend.h"')
+          replace_once('mooncake-store/src/storage_backend.cpp', '        case StorageBackendType::kDistributed: {\n            auto distributed_config =', '        case StorageBackendType::kMemoryPool:\n            return CreateMemoryPoolStorageBackend(config);\n        case StorageBackendType::kDistributed: {\n            auto distributed_config =')
 
           cmake = Path('mooncake-store/src/CMakeLists.txt')
           s = cmake.read_text()
           marker = '    storage_backend.cpp\n'
           if marker not in s:
               raise SystemExit('CMake storage_backend.cpp marker not found')
-          s = s.replace(marker, marker + '    memory_pool_storage_backend.cpp\n    memory_pool_storage_backend_factory.cpp\n', 1)
-          cmake.write_text(s)
-
-          workflow = Path('.github/workflows/apply-memory-pool-wiring.yml')
-          workflow.unlink()
+          cmake.write_text(s.replace(marker, marker + '    memory_pool_storage_backend.cpp\n    memory_pool_storage_backend_factory.cpp\n', 1))
+          Path('.github/workflows/apply-memory-pool-wiring.yml').unlink()
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
