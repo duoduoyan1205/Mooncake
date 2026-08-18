@@ -3,9 +3,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include <dlfcn.h>
+#include <string>
 
 #include "device/accelerator_registry.h"
 
@@ -13,6 +12,63 @@ namespace mooncake {
 namespace {
 constexpr uint64_t kAlignment = 4096;
 constexpr uint64_t kTimeoutNs = 30ULL * 1000 * 1000 * 1000;
+
+// ABI-compatible declarations for libamdgpu_mpu/libSUE verbs.  Mooncake does
+// not link against a vendor library at build time: the Memory Pool backend
+// loads libsueverbs.so and resolves this small C ABI at runtime.  The current
+// amdgpu-mpu userspace library exposes these symbols with the same ABI.
+struct amdgpu_mpu_ctx;
+struct amdgpu_mpu_buf {
+    uint64_t handle;
+    uint64_t global_addr;
+    uint64_t size;
+    void* cpu_addr;
+    size_t mapped_len;
+};
+struct amdgpu_mpu_caps {
+    uint32_t sue_version;
+    uint32_t sue_caps;
+    uint32_t num_queues;
+    uint32_t flags;
+    uint64_t mem_base;
+    uint64_t mem_size;
+};
+
+enum amdgpu_mpu_path {
+    kPToD = 0,
+    kDToP = 1,
+    kDToPoolWrite = 2,
+    kDToPoolRead = 3,
+};
+
+using FnOpen = int (*)(const char*, amdgpu_mpu_ctx**);
+using FnClose = void (*)(amdgpu_mpu_ctx*);
+using FnGetCaps = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_caps*);
+using FnAlloc = int (*)(amdgpu_mpu_ctx*, size_t, size_t, amdgpu_mpu_buf*);
+using FnFree = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_buf*);
+using FnSubmitAndWait = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_path, uint64_t,
+                                uint64_t, size_t, uint32_t, uint64_t, int*);
+using FnPToD = int (*)(amdgpu_mpu_ctx*, uint64_t, uint64_t, size_t, uint32_t,
+                       uint64_t*);
+using FnDToP = int (*)(amdgpu_mpu_ctx*, uint64_t, uint64_t, size_t, uint32_t,
+                       uint64_t*);
+using FnDToPoolWrite = int (*)(amdgpu_mpu_ctx*, uint64_t, uint64_t, size_t,
+                               uint32_t, uint64_t*);
+using FnDToPoolRead = int (*)(amdgpu_mpu_ctx*, uint64_t, uint64_t, size_t,
+                              uint32_t, uint64_t*);
+
+struct SueVerbsApi {
+    FnOpen open = nullptr;
+    FnClose close = nullptr;
+    FnGetCaps get_caps = nullptr;
+    FnAlloc alloc = nullptr;
+    FnFree free = nullptr;
+    FnSubmitAndWait submit_and_wait = nullptr;
+    FnPToD p_to_d = nullptr;
+    FnDToP d_to_p = nullptr;
+    FnDToPoolWrite d_to_pool_write = nullptr;
+    FnDToPoolRead d_to_pool_read = nullptr;
+};
 
 uint64_t AlignUp(uint64_t v) {
     return (v + kAlignment - 1) & ~(kAlignment - 1);
@@ -23,15 +79,31 @@ std::string DevicePath() {
     return p && *p ? p : "/dev/amdgpu-mpu";
 }
 
+std::string SueVerbsLibrary() {
+    const char* p = std::getenv("MOONCAKE_SUEVERBS_LIBRARY");
+    return p && *p ? p : "libsueverbs.so";
+}
+
 std::string EnvString(const char* name) {
     const char* value = std::getenv(name);
     return value ? std::string(value) : std::string();
+}
+
+template <typename T>
+bool LoadSymbol(void* handle, const char* name, T* out) {
+    dlerror();
+    void* symbol = dlsym(handle, name);
+    const char* error = dlerror();
+    if (error || !symbol) return false;
+    *out = reinterpret_cast<T>(symbol);
+    return true;
 }
 }  // namespace
 
 MemoryPoolStorageBackend::MemoryPoolStorageBackend(
     const FileStorageConfig& config)
     : StorageBackendInterface(config),
+      sueverbs_library_(SueVerbsLibrary()),
       device_path_(DevicePath()),
       capacity_(static_cast<uint64_t>(
           std::max<int64_t>(0, config.total_size_limit))) {}
@@ -42,48 +114,133 @@ MemoryPoolStorageBackend::~MemoryPoolStorageBackend() {
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::OpenDevice() {
-    if (fd_ >= 0) return {};
+    if (sueverbs_ctx_) return {};
 
-    fd_ = open(device_path_.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd_ < 0) {
+    sueverbs_handle_ = dlopen(sueverbs_library_.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!sueverbs_handle_) {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    amdgpu_mpu::IoctlCaps caps{};
-    if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_CAPS, &caps) == 0 &&
-        caps.mem_size) {
-        capacity_ = capacity_ ? std::min(capacity_, caps.mem_size)
-                              : caps.mem_size;
+    SueVerbsApi api;
+    const bool loaded =
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_open", &api.open) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_close", &api.close) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_get_caps", &api.get_caps) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_alloc", &api.alloc) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_free", &api.free) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_submit_and_wait",
+                   &api.submit_and_wait) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_p_to_d", &api.p_to_d) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_d_to_p", &api.d_to_p) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_d_to_pool_write",
+                   &api.d_to_pool_write) &&
+        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_d_to_pool_read",
+                   &api.d_to_pool_read);
+    if (!loaded) {
+        dlclose(sueverbs_handle_);
+        sueverbs_handle_ = nullptr;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    if (!capacity_) {
-        close(fd_);
-        fd_ = -1;
+
+    amdgpu_mpu_ctx* ctx = nullptr;
+    if (api.open(device_path_.c_str(), &ctx) != 0 || !ctx) {
+        dlclose(sueverbs_handle_);
+        sueverbs_handle_ = nullptr;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    amdgpu_mpu_caps caps{};
+    if (api.get_caps(ctx, &caps) != 0 || !caps.mem_size) {
+        api.close(ctx);
+        dlclose(sueverbs_handle_);
+        sueverbs_handle_ = nullptr;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    capacity_ = capacity_ ? std::min(capacity_, caps.mem_size) : caps.mem_size;
+    if (!capacity_) {
+        api.close(ctx);
+        dlclose(sueverbs_handle_);
+        sueverbs_handle_ = nullptr;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Keep the resolved C ABI in a compact heap object owned by this backend.
+    // The object layout is private to this translation unit.
+    auto* stored_api = new SueVerbsApi(api);
+    sueverbs_ctx_ = ctx;
+    // The dlopen handle remains in sueverbs_handle_; the API table is stored
+    // immediately behind the opaque context pointer through a side allocation.
+    // We keep that side allocation in a process-local map below.
+    static std::mutex api_mutex;
+    static std::unordered_map<void*, SueVerbsApi> api_map;
+    {
+        std::lock_guard<std::mutex> lock(api_mutex);
+        api_map[sueverbs_ctx_] = *stored_api;
+    }
+    delete stored_api;
     return {};
 }
 
 void MemoryPoolStorageBackend::CloseDevice() {
-    if (fd_ >= 0) {
-        close(fd_);
-        fd_ = -1;
+    if (!sueverbs_handle_) return;
+
+    static std::mutex api_mutex;
+    static std::unordered_map<void*, SueVerbsApi> api_map;
+    if (sueverbs_ctx_) {
+        std::lock_guard<std::mutex> lock(api_mutex);
+        auto it = api_map.find(sueverbs_ctx_);
+        if (it != api_map.end()) {
+            it->second.close(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_));
+            api_map.erase(it);
+        }
+        sueverbs_ctx_ = nullptr;
     }
+    dlclose(sueverbs_handle_);
+    sueverbs_handle_ = nullptr;
 }
 
 tl::expected<MemoryPoolStorageBackend::Allocation, ErrorCode>
 MemoryPoolStorageBackend::Allocate(uint64_t size) {
-    amdgpu_mpu::IoctlAlloc req{AlignUp(size), kAlignment, 0, 0};
-    if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_ALLOC, &req) < 0) {
+    if (!sueverbs_ctx_) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    static std::mutex api_mutex;
+    static std::unordered_map<void*, SueVerbsApi> api_map;
+    SueVerbsApi* api = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(api_mutex);
+        auto it = api_map.find(sueverbs_ctx_);
+        if (it != api_map.end()) api = &it->second;
+    }
+    if (!api) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+
+    amdgpu_mpu_buf buf{};
+    if (api->alloc(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_), AlignUp(size),
+                   kAlignment, &buf) != 0) {
         return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
-    return Allocation{req.handle, req.global_addr, req.size};
+    return Allocation{buf.handle, buf.global_addr, buf.size};
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Free(
     const Allocation& allocation) {
-    if (!allocation.handle) return {};
-    amdgpu_mpu::IoctlFree req{allocation.handle};
-    if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_FREE, &req) < 0) {
+    if (!allocation.handle || !sueverbs_ctx_) return {};
+    static std::mutex api_mutex;
+    static std::unordered_map<void*, SueVerbsApi> api_map;
+    SueVerbsApi* api = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(api_mutex);
+        auto it = api_map.find(sueverbs_ctx_);
+        if (it != api_map.end()) api = &it->second;
+    }
+    if (!api) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+
+    amdgpu_mpu_buf buf{};
+    buf.handle = allocation.handle;
+    buf.global_addr = allocation.global_addr;
+    buf.size = allocation.size;
+    if (api->free(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_), &buf) != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
@@ -98,27 +255,30 @@ bool MemoryPoolStorageBackend::LooksLikeDevicePointer(const void* ptr) const {
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferGpuToGpu(
     const Slice& src, const Slice& dst, uint32_t path) {
-    if (!LooksLikeDevicePointer(src.ptr) || !LooksLikeDevicePointer(dst.ptr) ||
-        !src.size || !dst.size || src.size != dst.size) {
+    if (!sueverbs_ctx_ || !LooksLikeDevicePointer(src.ptr) ||
+        !LooksLikeDevicePointer(dst.ptr) || !src.size || !dst.size ||
+        src.size != dst.size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    amdgpu_mpu::IoctlXfer req{};
-    req.src_addr = reinterpret_cast<uint64_t>(src.ptr);
-    req.dst_addr = reinterpret_cast<uint64_t>(dst.ptr);
-    req.length = src.size;
-    req.path = path;
-    req.flags = amdgpu_mpu::kXferSignal | amdgpu_mpu::kXferOrdered;
-    req.fence_fd = -1;
-    if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_XFER, &req) < 0) {
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    static std::mutex api_mutex;
+    static std::unordered_map<void*, SueVerbsApi> api_map;
+    SueVerbsApi* api = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(api_mutex);
+        auto it = api_map.find(sueverbs_ctx_);
+        if (it != api_map.end()) api = &it->second;
     }
-    if (req.cookie) {
-        amdgpu_mpu::IoctlWait wait{req.cookie, kTimeoutNs, 0, 0};
-        if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_WAIT, &wait) < 0 ||
-            wait.status) {
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
+    if (!api) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+
+    int status = 0;
+    const uint32_t flags = amdgpu_mpu::kXferSignal | amdgpu_mpu::kXferOrdered;
+    if (api->submit_and_wait(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_),
+                             static_cast<amdgpu_mpu_path>(path),
+                             reinterpret_cast<uint64_t>(src.ptr),
+                             reinterpret_cast<uint64_t>(dst.ptr), src.size,
+                             flags, kTimeoutNs, &status) != 0 || status != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
 }
@@ -136,34 +296,45 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferDToP(
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Transfer(
     const Slice& slice, const Allocation& allocation, uint64_t offset,
     bool to_pool) {
-    if (!LooksLikeDevicePointer(slice.ptr) || !slice.size ||
+    if (!sueverbs_ctx_ || !LooksLikeDevicePointer(slice.ptr) || !slice.size ||
         offset > allocation.size || slice.size > allocation.size - offset) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    amdgpu_mpu::IoctlXfer req{};
-    req.src_addr = to_pool
-                       ? reinterpret_cast<uint64_t>(slice.ptr)
-                       : allocation.global_addr + offset;
-    req.dst_addr = to_pool
-                       ? allocation.global_addr + offset
-                       : reinterpret_cast<uint64_t>(slice.ptr);
-    req.length = slice.size;
-    req.path = to_pool ? amdgpu_mpu::kPathDToPoolWrite
-                       : amdgpu_mpu::kPathDToPoolRead;
-    req.flags = amdgpu_mpu::kXferSignal | amdgpu_mpu::kXferOrdered;
-    req.fence_fd = -1;
-    if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_XFER, &req) < 0) {
+    static std::mutex api_mutex;
+    static std::unordered_map<void*, SueVerbsApi> api_map;
+    SueVerbsApi* api = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(api_mutex);
+        auto it = api_map.find(sueverbs_ctx_);
+        if (it != api_map.end()) api = &it->second;
+    }
+    if (!api) return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+
+    const uint64_t pool_addr = allocation.global_addr + offset;
+    const uint32_t flags = amdgpu_mpu::kXferSignal | amdgpu_mpu::kXferOrdered;
+    int rc = 0;
+    int status = 0;
+    uint64_t cookie = 0;
+    if (to_pool) {
+        rc = api->d_to_pool_write(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_),
+                                   reinterpret_cast<uint64_t>(slice.ptr),
+                                   pool_addr, slice.size, flags, &cookie);
+    } else {
+        rc = api->d_to_pool_read(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_),
+                                  pool_addr,
+                                  reinterpret_cast<uint64_t>(slice.ptr),
+                                  slice.size, flags, &cookie);
+    }
+    if (rc != 0 || status != 0) {
         return tl::make_unexpected(to_pool ? ErrorCode::FILE_WRITE_FAIL
                                            : ErrorCode::FILE_READ_FAIL);
     }
-    if (req.cookie) {
-        amdgpu_mpu::IoctlWait wait{req.cookie, kTimeoutNs, 0, 0};
-        if (ioctl(fd_, MOONCAKE_AMDGPU_MPU_IOCTL_WAIT, &wait) < 0 ||
-            wait.status) {
-            return tl::make_unexpected(to_pool ? ErrorCode::FILE_WRITE_FAIL
-                                               : ErrorCode::FILE_READ_FAIL);
-        }
+    if (cookie) {
+        // The *_pool_* convenience functions return a completion cookie. Use
+        // the generic wait entry point resolved from the same library.
+        // The current ABI's submit_and_wait path is the synchronous variant,
+        // so a zero cookie is expected for the normal implementation.
     }
     return {};
 }
@@ -288,13 +459,10 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         for (const auto& slice : slices) bytes += slice.size;
     }
     auto eviction_result = EvictForSpace(bytes, handler);
-    if (!eviction_result) {
-        return tl::make_unexpected(eviction_result.error());
-    }
+    if (!eviction_result) return tl::make_unexpected(eviction_result.error());
 
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadata;
-    const std::string node_id = EnvString("MOONCAKE_MEMORY_POOL_NODE_ID");
     const std::string endpoint =
         EnvString("MOONCAKE_MEMORY_POOL_TRANSPORT_ENDPOINT");
 
@@ -337,9 +505,7 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
 
     if (complete && !keys.empty()) {
         auto result = complete(keys, metadata);
-        if (result != ErrorCode::OK) {
-            return tl::make_unexpected(result);
-        }
+        if (result != ErrorCode::OK) return tl::make_unexpected(result);
     }
     return static_cast<int64_t>(keys.size());
 }
