@@ -9,43 +9,19 @@
 #include <utility>
 #include <vector>
 
+#include <libamdgpu_mpu.h>
+
 namespace mooncake {
 namespace {
 constexpr uint64_t kAlignment = 4096;
 constexpr uint64_t kTimeoutNs = 30ULL * 1000 * 1000 * 1000;
-constexpr uint32_t kXferSignal = 1u << 0;
-constexpr uint32_t kXferOrdered = 1u << 3;
 
-enum amdgpu_mpu_path {
-    AMDGPU_MPU_P_TO_D = 0,
-    AMDGPU_MPU_D_TO_P = 1,
-    AMDGPU_MPU_D_TO_POOL_WRITE = 2,
-    AMDGPU_MPU_D_TO_POOL_READ = 3,
-};
-
-struct amdgpu_mpu_ctx;
-struct amdgpu_mpu_buf {
-    uint64_t handle;
-    uint64_t global_addr;
-    uint64_t size;
-    void* cpu_addr;
-    size_t mapped_len;
-};
-struct amdgpu_mpu_caps {
-    uint32_t sue_version;
-    uint32_t sue_caps;
-    uint32_t num_queues;
-    uint32_t flags;
-    uint64_t mem_base;
-    uint64_t mem_size;
-};
-
-using FnOpen = int (*)(const char*, amdgpu_mpu_ctx**);
-using FnClose = void (*)(amdgpu_mpu_ctx*);
-using FnGetCaps = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_caps*);
-using FnAlloc = int (*)(amdgpu_mpu_ctx*, size_t, size_t, amdgpu_mpu_buf*);
-using FnFree = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_buf*);
-using FnSubmitAndWait = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_path, uint64_t,
+using FnOpen = int (*)(const char*, amdgpu_mpu_ctx_t**);
+using FnClose = void (*)(amdgpu_mpu_ctx_t*);
+using FnGetCaps = int (*)(amdgpu_mpu_ctx_t*, amdgpu_mpu_caps_t*);
+using FnAlloc = int (*)(amdgpu_mpu_ctx_t*, size_t, size_t, amdgpu_mpu_buf_t*);
+using FnFree = int (*)(amdgpu_mpu_ctx_t*, amdgpu_mpu_buf_t*);
+using FnSubmitAndWait = int (*)(amdgpu_mpu_ctx_t*, amdgpu_mpu_path_t, uint64_t,
                                 uint64_t, size_t, uint32_t, uint64_t, int*);
 
 template <typename T>
@@ -83,7 +59,7 @@ struct MemoryPoolTransferEngine::Api {
 
 struct MemoryPoolTransferEngine::Node {
     std::string device_path;
-    amdgpu_mpu_ctx* ctx = nullptr;
+    amdgpu_mpu_ctx_t* ctx = nullptr;
     uint64_t capacity = 0;
 };
 
@@ -134,14 +110,14 @@ int MemoryPoolTransferEngine::Open() {
     }
 
     for (auto& node : context_->nodes) {
-        amdgpu_mpu_ctx* raw_ctx = nullptr;
+        amdgpu_mpu_ctx_t* raw_ctx = nullptr;
         int rc = api.open(node.device_path.c_str(), &raw_ctx);
         if (rc || !raw_ctx) {
             Close();
             return rc ? rc : -ENODEV;
         }
 
-        amdgpu_mpu_caps caps{};
+        amdgpu_mpu_caps_t caps{};
         rc = api.get_caps(raw_ctx, &caps);
         if (rc || !caps.mem_size) {
             api.close(raw_ctx);
@@ -207,7 +183,7 @@ int MemoryPoolTransferEngine::Allocate(uint64_t size, Allocation* allocation) {
         context_->next_node++ % context_->nodes.size());
     Node& node = context_->nodes[node_id];
 
-    amdgpu_mpu_buf buf{};
+    amdgpu_mpu_buf_t buf{};
     const int rc = context_->api->alloc(node.ctx, aligned, kAlignment, &buf);
     if (rc) return rc;
 
@@ -222,7 +198,7 @@ int MemoryPoolTransferEngine::Free(const Allocation& allocation) {
     if (!IsOpen() || !allocation.handle) return 0;
     if (allocation.node_id >= context_->nodes.size()) return -EINVAL;
     Node& node = context_->nodes[allocation.node_id];
-    amdgpu_mpu_buf buf{};
+    amdgpu_mpu_buf_t buf{};
     buf.handle = allocation.handle;
     buf.global_addr = allocation.global_addr;
     buf.size = allocation.size;
@@ -236,9 +212,10 @@ int MemoryPoolTransferEngine::Transfer(AccessPath path, uint32_t node_id,
     Node& node = context_->nodes[node_id];
     int status = 0;
     const int rc = context_->api->submit_and_wait(
-        node.ctx, static_cast<amdgpu_mpu_path>(static_cast<uint32_t>(path)),
-        source_addr, target_addr, length, kXferSignal | kXferOrdered,
-        kTimeoutNs, &status);
+        node.ctx, static_cast<amdgpu_mpu_path_t>(static_cast<uint32_t>(path)),
+        source_addr, target_addr, length,
+        AMDGPU_MPU_XFER_F_SIGNAL | AMDGPU_MPU_XFER_F_ORDERED, kTimeoutNs,
+        &status);
     return rc == 0 ? status : rc;
 }
 
