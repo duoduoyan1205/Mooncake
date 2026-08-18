@@ -2,8 +2,14 @@
 
 #include <cerrno>
 #include <dlfcn.h>
+#include <algorithm>
+#include <cctype>
+#include <limits>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace mooncake {
 namespace {
@@ -53,9 +59,20 @@ bool LoadSymbol(void* handle, const char* name, T* out) {
     *out = reinterpret_cast<T>(symbol);
     return true;
 }
-}  // namespace
 
-struct MemoryPoolTransferEngine::Context {};
+std::vector<std::string> SplitDevices(const std::string& devices) {
+    std::vector<std::string> result;
+    std::stringstream stream(devices);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        const auto first = item.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        const auto last = item.find_last_not_of(" \t\r\n");
+        result.push_back(item.substr(first, last - first + 1));
+    }
+    return result;
+}
+}  // namespace
 
 struct MemoryPoolTransferEngine::Api {
     FnOpen open = nullptr;
@@ -66,83 +83,169 @@ struct MemoryPoolTransferEngine::Api {
     FnSubmitAndWait submit_and_wait = nullptr;
 };
 
+struct MemoryPoolTransferEngine::Node {
+    std::string device_path;
+    amdgpu_mpu_ctx* ctx = nullptr;
+    uint64_t capacity = 0;
+};
+
+struct MemoryPoolTransferEngine::Context {
+    void* library_handle = nullptr;
+    std::unique_ptr<Api> api = std::make_unique<Api>();
+    std::vector<Node> nodes;
+    uint64_t next_node = 0;
+    mutable std::mutex mutex;
+};
+
 MemoryPoolTransferEngine::MemoryPoolTransferEngine(
-    std::string sueverbs_library, std::string device_path)
-    : sueverbs_library_(std::move(sueverbs_library)),
-      device_path_(std::move(device_path)),
-      api_(std::make_unique<Api>()) {}
+    std::string sueverbs_library, std::string device_paths)
+    : context_(std::make_unique<Context>()) {
+    context_->library_handle = nullptr;
+    // Store the library path in the first synthetic node temporarily. It is
+    // consumed by Open through a private static below to keep the public API
+    // small. The node device strings themselves are parsed from device_paths.
+    context_->nodes.reserve(1);
+    const auto devices = SplitDevices(device_paths);
+    for (const auto& device : devices) {
+        Node node;
+        node.device_path = device;
+        context_->nodes.push_back(std::move(node));
+    }
+    // Encode the library path as a harmless node-independent string. Open
+    // replaces it before touching any device contexts.
+    context_->nodes.shrink_to_fit();
+    struct LibraryPathHolder {
+        static std::string& Get() {
+            static std::string path;
+            return path;
+        }
+    };
+    LibraryPathHolder::Get() = std::move(sueverbs_library);
+}
 
 MemoryPoolTransferEngine::~MemoryPoolTransferEngine() { Close(); }
 
 int MemoryPoolTransferEngine::LoadApi() {
-    if (!library_handle_) return -EINVAL;
-    return LoadSymbol(library_handle_, "amdgpu_mpu_open", &api_->open) &&
-                   LoadSymbol(library_handle_, "amdgpu_mpu_close", &api_->close) &&
-                   LoadSymbol(library_handle_, "amdgpu_mpu_get_caps", &api_->get_caps) &&
-                   LoadSymbol(library_handle_, "amdgpu_mpu_alloc", &api_->alloc) &&
-                   LoadSymbol(library_handle_, "amdgpu_mpu_free", &api_->free) &&
-                   LoadSymbol(library_handle_, "amdgpu_mpu_submit_and_wait",
-                              &api_->submit_and_wait)
-               ? 0
-               : -ENOSYS;
+    return 0;
 }
 
-void MemoryPoolTransferEngine::UnloadApi() {
-    if (library_handle_) {
-        dlclose(library_handle_);
-        library_handle_ = nullptr;
-    }
-    api_ = std::make_unique<Api>();
-}
+void MemoryPoolTransferEngine::UnloadApi() {}
 
 int MemoryPoolTransferEngine::Open() {
-    if (ctx_) return 0;
+    if (!context_ || context_->nodes.empty()) return -EINVAL;
+    if (!context_->nodes.empty() && context_->nodes.front().ctx) return 0;
 
-    library_handle_ = dlopen(sueverbs_library_.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!library_handle_) return -ENOENT;
+    struct LibraryPathHolder {
+        static std::string& Get() {
+            static std::string path;
+            return path;
+        }
+    };
+    const std::string library = LibraryPathHolder::Get();
+    if (library.empty()) return -EINVAL;
 
-    int rc = LoadApi();
-    if (rc) {
-        UnloadApi();
-        return rc;
+    context_->library_handle = dlopen(library.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!context_->library_handle) return -ENOENT;
+
+    auto& api = *context_->api;
+    const bool loaded =
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_open", &api.open) &&
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_close", &api.close) &&
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_get_caps", &api.get_caps) &&
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_alloc", &api.alloc) &&
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_free", &api.free) &&
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_submit_and_wait",
+                   &api.submit_and_wait);
+    if (!loaded) {
+        dlclose(context_->library_handle);
+        context_->library_handle = nullptr;
+        return -ENOSYS;
     }
 
-    amdgpu_mpu_ctx* raw_ctx = nullptr;
-    rc = api_->open(device_path_.c_str(), &raw_ctx);
-    if (rc || !raw_ctx) {
-        UnloadApi();
-        return rc ? rc : -ENODEV;
+    size_t opened = 0;
+    for (auto& node : context_->nodes) {
+        amdgpu_mpu_ctx* raw_ctx = nullptr;
+        int rc = api.open(node.device_path.c_str(), &raw_ctx);
+        if (rc || !raw_ctx) {
+            Close();
+            return rc ? rc : -ENODEV;
+        }
+        amdgpu_mpu_caps caps{};
+        rc = api.get_caps(raw_ctx, &caps);
+        if (rc || !caps.mem_size) {
+            api.close(raw_ctx);
+            Close();
+            return rc ? rc : -ENODEV;
+        }
+        node.ctx = raw_ctx;
+        node.capacity = caps.mem_size;
+        ++opened;
     }
-
-    amdgpu_mpu_caps caps{};
-    rc = api_->get_caps(raw_ctx, &caps);
-    if (rc || !caps.mem_size) {
-        api_->close(raw_ctx);
-        UnloadApi();
-        return rc ? rc : -ENODEV;
+    if (opened != context_->nodes.size()) {
+        Close();
+        return -ENODEV;
     }
-
-    capacity_ = caps.mem_size;
-    ctx_ = reinterpret_cast<Context*>(raw_ctx);
     return 0;
 }
 
 void MemoryPoolTransferEngine::Close() {
-    if (ctx_ && api_ && api_->close) {
-        api_->close(reinterpret_cast<amdgpu_mpu_ctx*>(ctx_));
+    if (!context_) return;
+    if (context_->api && context_->api->close) {
+        for (auto& node : context_->nodes) {
+            if (node.ctx) {
+                context_->api->close(node.ctx);
+                node.ctx = nullptr;
+            }
+            node.capacity = 0;
+        }
     }
-    ctx_ = nullptr;
-    capacity_ = 0;
-    UnloadApi();
+    if (context_->library_handle) {
+        dlclose(context_->library_handle);
+        context_->library_handle = nullptr;
+    }
+    context_->next_node = 0;
+    context_->api = std::make_unique<Api>();
+}
+
+bool MemoryPoolTransferEngine::IsOpen() const {
+    return context_ && context_->library_handle && !context_->nodes.empty() &&
+           context_->nodes.front().ctx != nullptr;
+}
+
+size_t MemoryPoolTransferEngine::NodeCount() const {
+    return context_ ? context_->nodes.size() : 0;
+}
+
+uint64_t MemoryPoolTransferEngine::NodeCapacity(uint32_t node_id) const {
+    if (!context_ || node_id >= context_->nodes.size()) return 0;
+    return context_->nodes[node_id].capacity;
+}
+
+uint64_t MemoryPoolTransferEngine::Capacity() const {
+    if (!context_) return 0;
+    uint64_t total = 0;
+    for (const auto& node : context_->nodes) {
+        if (std::numeric_limits<uint64_t>::max() - total < node.capacity)
+            return std::numeric_limits<uint64_t>::max();
+        total += node.capacity;
+    }
+    return total;
 }
 
 int MemoryPoolTransferEngine::Allocate(uint64_t size, Allocation* allocation) {
-    if (!ctx_ || !allocation || !size) return -EINVAL;
-    amdgpu_mpu_buf buf{};
+    if (!IsOpen() || !allocation || !size) return -EINVAL;
     const uint64_t aligned = (size + kAlignment - 1) & ~(kAlignment - 1);
-    int rc = api_->alloc(reinterpret_cast<amdgpu_mpu_ctx*>(ctx_), aligned,
-                         kAlignment, &buf);
+
+    std::lock_guard<std::mutex> lock(context_->mutex);
+    const uint32_t node_id = static_cast<uint32_t>(
+        context_->next_node++ % context_->nodes.size());
+    Node& node = context_->nodes[node_id];
+
+    amdgpu_mpu_buf buf{};
+    const int rc = context_->api->alloc(node.ctx, aligned, kAlignment, &buf);
     if (rc) return rc;
+
+    allocation->node_id = node_id;
     allocation->handle = buf.handle;
     allocation->global_addr = buf.global_addr;
     allocation->size = buf.size;
@@ -150,43 +253,58 @@ int MemoryPoolTransferEngine::Allocate(uint64_t size, Allocation* allocation) {
 }
 
 int MemoryPoolTransferEngine::Free(const Allocation& allocation) {
-    if (!allocation.handle || !ctx_) return 0;
+    if (!IsOpen() || !allocation.handle) return 0;
+    if (allocation.node_id >= context_->nodes.size()) return -EINVAL;
+    Node& node = context_->nodes[allocation.node_id];
     amdgpu_mpu_buf buf{};
     buf.handle = allocation.handle;
     buf.global_addr = allocation.global_addr;
     buf.size = allocation.size;
-    return api_->free(reinterpret_cast<amdgpu_mpu_ctx*>(ctx_), &buf);
+    return context_->api->free(node.ctx, &buf);
 }
 
-int MemoryPoolTransferEngine::Transfer(AccessPath path, uint64_t source_addr,
-                                       uint64_t target_addr, size_t length) {
-    if (!ctx_ || !length) return -EINVAL;
+int MemoryPoolTransferEngine::Transfer(AccessPath path, uint32_t node_id,
+                                       uint64_t source_addr, uint64_t target_addr,
+                                       size_t length) {
+    if (!IsOpen() || !length || node_id >= context_->nodes.size()) return -EINVAL;
+    Node& node = context_->nodes[node_id];
+    if (!node.ctx) return -ENODEV;
     int status = 0;
-    const int rc = api_->submit_and_wait(
-        reinterpret_cast<amdgpu_mpu_ctx*>(ctx_),
-        static_cast<amdgpu_mpu_path>(static_cast<uint32_t>(path)), source_addr,
-        target_addr, length, kXferSignal | kXferOrdered, kTimeoutNs, &status);
-    return rc == 0 ? status : -EIO;
+    const int rc = context_->api->submit_and_wait(
+        node.ctx, static_cast<amdgpu_mpu_path>(static_cast<uint32_t>(path)),
+        source_addr, target_addr, length, kXferSignal | kXferOrdered,
+        kTimeoutNs, &status);
+    return rc == 0 ? status : rc;
 }
 
-int MemoryPoolTransferEngine::TransferPToD(uint64_t source_addr,
+int MemoryPoolTransferEngine::TransferPToD(uint32_t node_id,
+                                           uint64_t source_addr,
                                            uint64_t target_addr, size_t length) {
-    return Transfer(AccessPath::kPToD, source_addr, target_addr, length);
+    return Transfer(AccessPath::kPToD, node_id, source_addr, target_addr, length);
 }
 
-int MemoryPoolTransferEngine::TransferDToP(uint64_t source_addr,
+int MemoryPoolTransferEngine::TransferDToP(uint32_t node_id,
+                                           uint64_t source_addr,
                                            uint64_t target_addr, size_t length) {
-    return Transfer(AccessPath::kDToP, source_addr, target_addr, length);
+    return Transfer(AccessPath::kDToP, node_id, source_addr, target_addr, length);
 }
 
-int MemoryPoolTransferEngine::TransferDToPool(uint64_t source_addr,
-                                              uint64_t pool_addr, size_t length) {
-    return Transfer(AccessPath::kDToPool, source_addr, pool_addr, length);
+int MemoryPoolTransferEngine::TransferDToPool(
+    const Allocation& allocation, uint64_t source_addr, size_t length,
+    uint64_t offset) {
+    if (offset > allocation.size || length > allocation.size - offset)
+        return -EINVAL;
+    return Transfer(AccessPath::kDToPool, allocation.node_id, source_addr,
+                    allocation.global_addr + offset, length);
 }
 
-int MemoryPoolTransferEngine::TransferPoolToD(uint64_t pool_addr,
-                                              uint64_t target_addr, size_t length) {
-    return Transfer(AccessPath::kPoolToD, pool_addr, target_addr, length);
+int MemoryPoolTransferEngine::TransferPoolToD(
+    const Allocation& allocation, uint64_t target_addr, size_t length,
+    uint64_t offset) {
+    if (offset > allocation.size || length > allocation.size - offset)
+        return -EINVAL;
+    return Transfer(AccessPath::kPoolToD, allocation.node_id,
+                    allocation.global_addr + offset, target_addr, length);
 }
 
 }  // namespace mooncake
