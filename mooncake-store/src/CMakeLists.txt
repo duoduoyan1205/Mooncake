@@ -14,6 +14,8 @@ set(MOONCAKE_STORE_SOURCES
     mmap_arena.cpp
     master_metric_manager.cpp
     storage_backend.cpp
+    memory_pool_storage_backend.cpp
+    memory_pool_storage_backend_factory.cpp
     thread_pool.cpp
     etcd_helper.cpp
     segment.cpp

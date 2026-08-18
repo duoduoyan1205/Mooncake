@@ -163,7 +163,8 @@ enum class StorageBackendType {
     kFilePerKey,
     kBucket,
     kOffsetAllocator,
-    kDistributed
+    kDistributed,
+    kMemoryPool
 };
 
 static constexpr size_t kKB = 1024;
@@ -1640,5 +1641,8 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config);
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateMemoryPoolStorageBackend(const FileStorageConfig& config);
 
 }  // namespace mooncake

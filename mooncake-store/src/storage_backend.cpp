@@ -48,6 +48,7 @@ struct FdGuard {
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
+#include "memory_pool_storage_backend.h"
 
 namespace mooncake {
 
@@ -5489,6 +5490,8 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return std::make_shared<OffsetAllocatorStorageBackend>(
                 config, offset_backend_config);
         }
+        case StorageBackendType::kMemoryPool:
+            return CreateMemoryPoolStorageBackend(config);
         case StorageBackendType::kDistributed: {
             auto distributed_config =
                 DistributedStorageConfig::FromEnvironment();
