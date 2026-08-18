@@ -37,7 +37,8 @@ inline std::ostream& operator<<(std::ostream& os,
                              {ReplicaType::DISK, "DISK"},
                              {ReplicaType::LOCAL_DISK, "LOCAL_DISK"},
                              {ReplicaType::NOF_SSD, "NOF_SSD"},
-                             {ReplicaType::ALL, "ALL"}};
+                             {ReplicaType::ALL, "ALL"},
+                             {ReplicaType::MEMORY_POOL, "MEMORY_POOL"}};
 
     os << (replica_type_strings.count(replicaType)
                ? replica_type_strings.at(replicaType)
@@ -183,6 +184,14 @@ struct LocalDiskReplicaData {
     std::string transport_endpoint;
 };
 
+struct MemoryPoolReplicaData {
+    uint64_t allocation_handle = 0;
+    uint64_t global_address = 0;
+    uint64_t object_size = 0;
+    std::string node_id;
+    std::string transport_endpoint;
+};
+
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     YLT_REFL(MemoryDescriptor, buffer_descriptor);
@@ -204,6 +213,16 @@ struct LocalDiskDescriptor {
     uint64_t object_size = 0;
     std::string transport_endpoint;
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+};
+
+struct MemoryPoolDescriptor {
+    uint64_t allocation_handle = 0;
+    uint64_t global_address = 0;
+    uint64_t object_size = 0;
+    std::string node_id;
+    std::string transport_endpoint;
+    YLT_REFL(MemoryPoolDescriptor, allocation_handle, global_address,
+             object_size, node_id, transport_endpoint);
 };
 
 class Replica {
@@ -229,6 +248,17 @@ class Replica {
             LOG(ERROR) << "Invalid buffered replica type: " << replica_type;
         }
     }
+
+    // memory pool replica constructor
+    Replica(uint64_t allocation_handle, uint64_t global_address,
+            uint64_t object_size, std::string node_id,
+            std::string transport_endpoint, ReplicaStatus status)
+        : id_(next_id_.fetch_add(1)),
+          data_(MemoryPoolReplicaData{allocation_handle, global_address,
+                                       object_size, std::move(node_id),
+                                       std::move(transport_endpoint)}),
+          status_(status),
+          refcnt_(0) {}
 
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
@@ -364,6 +394,14 @@ class Replica {
         return std::holds_alternative<LocalDiskReplicaData>(data_);
     }
 
+    [[nodiscard]] bool is_memory_pool_replica() const {
+        return std::holds_alternative<MemoryPoolReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_memory_pool_replica(const Replica& replica) {
+        return replica.is_memory_pool_replica();
+    }
+
     [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
         return replica.is_local_disk_replica();
     }
@@ -466,12 +504,15 @@ class Replica {
         ReplicaType operator()(const LocalDiskReplicaData&) const {
             return ReplicaType::LOCAL_DISK;
         }
+        ReplicaType operator()(const MemoryPoolReplicaData&) const {
+            return ReplicaType::MEMORY_POOL;
+        }
     };
 
     struct Descriptor {
         ReplicaID id;
         std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,
-                     LocalDiskDescriptor>
+                     LocalDiskDescriptor, MemoryPoolDescriptor>
             descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, id, descriptor_variant, status);
@@ -508,6 +549,11 @@ class Replica {
 
         bool is_local_disk_replica() const noexcept {
             return std::holds_alternative<LocalDiskDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_memory_pool_replica() const noexcept {
+            return std::holds_alternative<MemoryPoolDescriptor>(
                 descriptor_variant);
         }
 
@@ -570,6 +616,20 @@ class Replica {
             }
             throw std::runtime_error("Expected LocalDiskDescriptor");
         }
+
+        MemoryPoolDescriptor& get_memory_pool_descriptor() {
+            if (auto* desc = std::get_if<MemoryPoolDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryPoolDescriptor");
+        }
+
+        const MemoryPoolDescriptor& get_memory_pool_descriptor() const {
+            if (auto* desc = std::get_if<MemoryPoolDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected MemoryPoolDescriptor");
+        }
     };
 
    private:
@@ -577,7 +637,7 @@ class Replica {
 
     ReplicaID id_;
     std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,
-                 LocalDiskReplicaData>
+                 LocalDiskReplicaData, MemoryPoolReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
@@ -628,6 +688,15 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
         desc.descriptor_variant = std::move(local_disk_desc);
+    } else if (is_memory_pool_replica()) {
+        const auto& pool_data = std::get<MemoryPoolReplicaData>(data_);
+        MemoryPoolDescriptor pool_desc;
+        pool_desc.allocation_handle = pool_data.allocation_handle;
+        pool_desc.global_address = pool_data.global_address;
+        pool_desc.object_size = pool_data.object_size;
+        pool_desc.node_id = pool_data.node_id;
+        pool_desc.transport_endpoint = pool_data.transport_endpoint;
+        desc.descriptor_variant = std::move(pool_desc);
     }
 
     return desc;
@@ -679,6 +748,10 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
         const auto& disk_data = std::get<DiskReplicaData>(replica.data_);
         os << "type: DISK, file_path: " << disk_data.file_path
            << ", object_size: " << disk_data.object_size;
+    } else if (replica.is_memory_pool_replica()) {
+        const auto& pool_data = std::get<MemoryPoolReplicaData>(replica.data_);
+        os << "type: MEMORY_POOL, global_address: " << pool_data.global_address
+           << ", object_size: " << pool_data.object_size;
     }
 
     os << ", refcnt: " << replica.refcnt_.load() << " }";

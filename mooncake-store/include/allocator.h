@@ -24,6 +24,7 @@ enum class ReplicaType {
     LOCAL_DISK,  // Local disk replica
     NOF_SSD,     // Nvme-oF SSD replica
     ALL,         // All memory and NoF replicas in put finalize path
+    MEMORY_POOL, // SUE Memory Pool replica
 };
 
 // Constant for unknown free space in allocators that don't track it precisely
