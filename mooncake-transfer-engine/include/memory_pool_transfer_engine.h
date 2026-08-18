@@ -4,16 +4,14 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace mooncake {
 
-// Thin data-plane adapter for the MPU/SUE Memory Pool device.
-// The implementation is intentionally vendor-library agnostic: it loads the
-// userspace verbs ABI at runtime and exposes only the operations needed by
-// Mooncake Store. Object/replica policy remains in mooncake-store.
 class MemoryPoolTransferEngine {
  public:
     struct Allocation {
+        uint32_t node_id = 0;
         uint64_t handle = 0;
         uint64_t global_addr = 0;
         uint64_t size = 0;
@@ -27,42 +25,46 @@ class MemoryPoolTransferEngine {
     };
 
     MemoryPoolTransferEngine(std::string sueverbs_library,
-                             std::string device_path);
+                             std::string device_paths);
     ~MemoryPoolTransferEngine();
 
     MemoryPoolTransferEngine(const MemoryPoolTransferEngine&) = delete;
     MemoryPoolTransferEngine& operator=(const MemoryPoolTransferEngine&) = delete;
 
+    // device_paths is a comma-separated list. Each device is treated as one
+    // equivalent Memory Pool node. Placement is intentionally round-robin.
     int Open();
     void Close();
 
-    bool IsOpen() const { return ctx_ != nullptr; }
-    uint64_t Capacity() const { return capacity_; }
+    bool IsOpen() const;
+    size_t NodeCount() const;
+    uint64_t Capacity() const;
+    uint64_t NodeCapacity(uint32_t node_id) const;
 
     int Allocate(uint64_t size, Allocation* allocation);
     int Free(const Allocation& allocation);
 
-    int Transfer(AccessPath path, uint64_t source_addr, uint64_t target_addr,
-                 size_t length);
+    int Transfer(AccessPath path, uint32_t node_id, uint64_t source_addr,
+                 uint64_t target_addr, size_t length);
 
-    int TransferPToD(uint64_t source_addr, uint64_t target_addr, size_t length);
-    int TransferDToP(uint64_t source_addr, uint64_t target_addr, size_t length);
-    int TransferDToPool(uint64_t source_addr, uint64_t pool_addr, size_t length);
-    int TransferPoolToD(uint64_t pool_addr, uint64_t target_addr, size_t length);
+    int TransferPToD(uint32_t node_id, uint64_t source_addr,
+                     uint64_t target_addr, size_t length);
+    int TransferDToP(uint32_t node_id, uint64_t source_addr,
+                     uint64_t target_addr, size_t length);
+    int TransferDToPool(const Allocation& allocation, uint64_t source_addr,
+                        size_t length, uint64_t offset = 0);
+    int TransferPoolToD(const Allocation& allocation, uint64_t target_addr,
+                        size_t length, uint64_t offset = 0);
 
  private:
     struct Context;
     struct Api;
+    struct Node;
 
     int LoadApi();
     void UnloadApi();
 
-    void* library_handle_ = nullptr;
-    Context* ctx_ = nullptr;
-    std::unique_ptr<Api> api_;
-    std::string sueverbs_library_;
-    std::string device_path_;
-    uint64_t capacity_ = 0;
+    std::unique_ptr<Context> context_;
 };
 
 }  // namespace mooncake
