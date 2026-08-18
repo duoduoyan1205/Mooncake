@@ -2,19 +2,11 @@
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -32,6 +24,19 @@ constexpr unsigned char kDPattern = 0xa5;
 std::string EnvOrDefault(const char* name, const char* fallback) {
     const char* value = std::getenv(name);
     return value && *value ? std::string(value) : std::string(fallback);
+}
+
+std::vector<std::string> SplitDevices(const std::string& devices) {
+    std::vector<std::string> result;
+    std::stringstream stream(devices);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        const auto first = item.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        const auto last = item.find_last_not_of(" \t\r\n");
+        result.push_back(item.substr(first, last - first + 1));
+    }
+    return result;
 }
 
 class DeviceBuffer {
@@ -82,27 +87,29 @@ void ExpectPattern(const std::vector<unsigned char>& data, unsigned char value) 
 }
 }  // namespace
 
-// Integration test for an MPU/SUE-capable node. It intentionally skips when
-// the driver, SUE verbs library, or two GPU devices are unavailable. On a
-// real node it exercises all four MPU data-plane paths:
-//   P -> D, D -> P, D -> Memory Pool, Memory Pool -> D.
-TEST(MemoryPoolTransferEngineTest, FourAccessPaths) {
-    const std::string device_path =
-        EnvOrDefault("MOONCAKE_MEMORY_POOL_DEVICE", "/dev/amdgpu-mpu");
+TEST(MemoryPoolTransferEngineTest, FourAccessPathsMultiNode) {
+    const std::string device_paths =
+        EnvOrDefault("MOONCAKE_MEMORY_POOL_DEVICES",
+                     EnvOrDefault("MOONCAKE_MEMORY_POOL_DEVICE",
+                                  "/dev/amdgpu-mpu0"));
     const std::string sueverbs_library =
         EnvOrDefault("MOONCAKE_SUEVERBS_LIBRARY", "libsueverbs.so");
+    const auto devices = SplitDevices(device_paths);
+    if (devices.empty()) GTEST_SKIP() << "No MPU devices configured";
 
-    if (access(device_path.c_str(), R_OK | W_OK) != 0) {
-        GTEST_SKIP() << "MPU device is unavailable: " << device_path;
+    for (const auto& device : devices) {
+        if (access(device.c_str(), R_OK | W_OK) != 0) {
+            GTEST_SKIP() << "MPU device is unavailable: " << device;
+        }
     }
 
     int device_count = 0;
     ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
     if (device_count < 2) {
-        GTEST_SKIP() << "MPU P->D/D->P test requires at least two GPUs";
+        GTEST_SKIP() << "P->D/D->P test requires at least two GPUs";
     }
 
-    MemoryPoolTransferEngine engine(sueverbs_library, device_path);
+    MemoryPoolTransferEngine engine(sueverbs_library, device_paths);
     const int open_rc = engine.Open();
     if (open_rc != 0) {
         GTEST_SKIP() << "Unable to open MPU/SUE verbs backend, rc=" << open_rc
@@ -110,61 +117,62 @@ TEST(MemoryPoolTransferEngineTest, FourAccessPaths) {
     }
 
     ASSERT_TRUE(engine.IsOpen());
+    ASSERT_EQ(engine.NodeCount(), devices.size());
     ASSERT_GT(engine.Capacity(), 0u);
 
-    // P and D deliberately use different GPU devices. This prevents the
-    // direct P/D tests from accidentally becoming same-device copies.
     DeviceBuffer p_buffer(0, kTransferSize);
     DeviceBuffer d_buffer(1, kTransferSize);
 
-    // -----------------------------------------------------------------------
-    // 1. P -> D
-    // -----------------------------------------------------------------------
+    // P -> D and D -> P use the same MPU topology. Node 0 is sufficient for
+    // this directional pair; the Memory Pool placement itself is multi-node.
     p_buffer.Fill(kPPattern);
     d_buffer.Fill(0);
-    ASSERT_EQ(engine.TransferPToD(reinterpret_cast<uint64_t>(p_buffer.get()),
+    ASSERT_EQ(engine.TransferPToD(0, reinterpret_cast<uint64_t>(p_buffer.get()),
                                   reinterpret_cast<uint64_t>(d_buffer.get()),
                                   kTransferSize),
               0);
     ExpectPattern(d_buffer.ReadBack(), kPPattern);
 
-    // -----------------------------------------------------------------------
-    // 2. D -> P
-    // -----------------------------------------------------------------------
     d_buffer.Fill(kDPattern);
     p_buffer.Fill(0);
-    ASSERT_EQ(engine.TransferDToP(reinterpret_cast<uint64_t>(d_buffer.get()),
+    ASSERT_EQ(engine.TransferDToP(0, reinterpret_cast<uint64_t>(d_buffer.get()),
                                   reinterpret_cast<uint64_t>(p_buffer.get()),
                                   kTransferSize),
               0);
     ExpectPattern(p_buffer.ReadBack(), kDPattern);
 
-    // Allocate one Memory Pool object and use its global SUE address for both
-    // pool directions. No CPU virtual address is used for the pool object.
-    MemoryPoolTransferEngine::Allocation pool{};
-    ASSERT_EQ(engine.Allocate(kTransferSize, &pool), 0);
-    ASSERT_NE(pool.handle, 0u);
-    ASSERT_NE(pool.global_addr, 0u);
-    ASSERT_GE(pool.size, kTransferSize);
+    // Allocate one object per configured Memory Pool node plus one extra.
+    // The manager must assign node ids strictly round-robin.
+    std::vector<MemoryPoolTransferEngine::Allocation> allocations;
+    allocations.reserve(devices.size() + 1);
+    for (size_t i = 0; i < devices.size() + 1; ++i) {
+        MemoryPoolTransferEngine::Allocation allocation{};
+        ASSERT_EQ(engine.Allocate(kTransferSize, &allocation), 0);
+        ASSERT_NE(allocation.handle, 0u);
+        ASSERT_NE(allocation.global_addr, 0u);
+        ASSERT_GE(allocation.size, kTransferSize);
+        ASSERT_EQ(allocation.node_id, i % devices.size());
+        ASSERT_GT(engine.NodeCapacity(allocation.node_id), 0u);
+        allocations.push_back(allocation);
+    }
 
-    // -----------------------------------------------------------------------
-    // 3. D -> Memory Pool
-    // -----------------------------------------------------------------------
-    d_buffer.Fill(kDPattern);
-    ASSERT_EQ(engine.TransferDToPool(
-                  reinterpret_cast<uint64_t>(d_buffer.get()), pool.global_addr,
-                  kTransferSize),
-              0);
+    // Validate D -> Pool and Pool -> D independently on every node.
+    for (const auto& allocation : allocations) {
+        d_buffer.Fill(kDPattern);
+        ASSERT_EQ(engine.TransferDToPool(allocation,
+                                         reinterpret_cast<uint64_t>(d_buffer.get()),
+                                         kTransferSize),
+                  0);
 
-    // -----------------------------------------------------------------------
-    // 4. Memory Pool -> D
-    // -----------------------------------------------------------------------
-    d_buffer.Fill(0);
-    ASSERT_EQ(engine.TransferPoolToD(
-                  pool.global_addr, reinterpret_cast<uint64_t>(d_buffer.get()),
-                  kTransferSize),
-              0);
-    ExpectPattern(d_buffer.ReadBack(), kDPattern);
+        d_buffer.Fill(0);
+        ASSERT_EQ(engine.TransferPoolToD(
+                      allocation, reinterpret_cast<uint64_t>(d_buffer.get()),
+                      kTransferSize),
+                  0);
+        ExpectPattern(d_buffer.ReadBack(), kDPattern);
+    }
 
-    ASSERT_EQ(engine.Free(pool), 0);
+    for (const auto& allocation : allocations) {
+        ASSERT_EQ(engine.Free(allocation), 0);
+    }
 }
