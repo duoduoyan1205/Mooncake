@@ -19,11 +19,6 @@ std::string SueVerbsLibrary() {
     const char* p = std::getenv("MOONCAKE_SUEVERBS_LIBRARY");
     return p && *p ? p : "libsueverbs.so";
 }
-
-std::string EnvString(const char* name) {
-    const char* value = std::getenv(name);
-    return value ? std::string(value) : std::string();
-}
 }  // namespace
 
 MemoryPoolStorageBackend::MemoryPoolStorageBackend(
@@ -38,22 +33,25 @@ MemoryPoolStorageBackend::~MemoryPoolStorageBackend() { RemoveAll(); }
 
 tl::expected<MemoryPoolStorageBackend::Allocation, ErrorCode>
 MemoryPoolStorageBackend::Allocate(uint64_t size) {
-    if (!transfer_engine_ || !transfer_engine_->IsOpen()) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    if (!transfer_engine_ || !transfer_engine_->IsOpen() || !size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
     Allocation allocation;
     if (transfer_engine_->Allocate(size, &allocation) != 0) {
         return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
+    used_bytes_.fetch_add(allocation.size, std::memory_order_relaxed);
     return allocation;
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Free(
     const Allocation& allocation) {
-    if (!transfer_engine_) return {};
+    if (!transfer_engine_ || !allocation.handle) return {};
     if (transfer_engine_->Free(allocation) != 0) {
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
+    used_bytes_.fetch_sub(allocation.size, std::memory_order_relaxed);
     return {};
 }
 
@@ -87,7 +85,7 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferGpuToGpu(
         default:
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (rc != 0) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    if (rc != 0) return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     return {};
 }
 
@@ -117,10 +115,7 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Transfer(
                        : transfer_engine_->TransferPoolToD(
                              allocation, reinterpret_cast<uint64_t>(slice.ptr),
                              slice.size, offset);
-    if (rc != 0) {
-        return tl::make_unexpected(to_pool ? ErrorCode::FILE_WRITE_FAIL
-                                           : ErrorCode::FILE_READ_FAIL);
-    }
+    if (rc != 0) return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     return {};
 }
 
@@ -134,41 +129,6 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferPoolToD(
     return Transfer(dst, allocation, offset, false);
 }
 
-tl::expected<void, ErrorCode>
-MemoryPoolStorageBackend::RegisterRemoteAllocation(
-    const std::string& key, const Allocation& allocation) {
-    if (key.empty() || !allocation.handle || !allocation.global_addr ||
-        !allocation.size) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (!initialized_.load(std::memory_order_acquire)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = entries_.find(key);
-    if (it != entries_.end() && it->second.local_owner) {
-        used_bytes_.fetch_sub(it->second.allocation.size,
-                              std::memory_order_relaxed);
-    }
-    entries_[key] = Entry{allocation, next_sequence_.fetch_add(1), false};
-    return {};
-}
-
-tl::expected<void, ErrorCode>
-MemoryPoolStorageBackend::UnregisterRemoteAllocation(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = entries_.find(key);
-    if (it == entries_.end()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-    if (it->second.local_owner) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    entries_.erase(it);
-    return {};
-}
-
 tl::expected<MemoryPoolStorageBackend::Allocation, ErrorCode>
 MemoryPoolStorageBackend::GetAllocation(const std::string& key) const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -177,47 +137,6 @@ MemoryPoolStorageBackend::GetAllocation(const std::string& key) const {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     return it->second.allocation;
-}
-
-tl::expected<void, ErrorCode> MemoryPoolStorageBackend::EvictForSpace(
-    uint64_t required, EvictionHandler handler) {
-    while (used_bytes_.load(std::memory_order_relaxed) + required > capacity_) {
-        Entry victim;
-        std::string key;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = std::find_if(entries_.begin(), entries_.end(),
-                                   [](const auto& item) {
-                                       return item.second.local_owner;
-                                   });
-            if (it == entries_.end()) {
-                return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
-            }
-            for (auto candidate = entries_.begin(); candidate != entries_.end();
-                 ++candidate) {
-                if (candidate->second.local_owner &&
-                    candidate->second.sequence < it->second.sequence) {
-                    it = candidate;
-                }
-            }
-            key = it->first;
-            victim = it->second;
-        }
-        if (handler) {
-            auto r = handler({key});
-            if (!r) return tl::make_unexpected(r.error());
-        }
-        auto r = Free(victim.allocation);
-        if (!r) return r;
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = entries_.find(key);
-        if (it != entries_.end() && it->second.sequence == victim.sequence) {
-            used_bytes_.fetch_sub(it->second.allocation.size,
-                                  std::memory_order_relaxed);
-            entries_.erase(it);
-        }
-    }
-    return {};
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Init() {
@@ -248,23 +167,25 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& objects,
     std::function<ErrorCode(const std::vector<std::string>&,
                             std::vector<StorageObjectMetadata>&)> complete,
-    EvictionHandler handler) {
+    EvictionHandler /*handler*/) {
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    uint64_t bytes = 0;
+    // Memory Pool has no backend-owned eviction policy.  Space pressure is
+    // reported as allocation failure; KV eviction remains a Store/scheduler
+    // decision.
     for (const auto& [key, slices] : objects) {
-        (void)key;
-        for (const auto& slice : slices) bytes += slice.size;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (entries_.find(key) != entries_.end()) {
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+        (void)slices;
     }
-    auto eviction_result = EvictForSpace(bytes, handler);
-    if (!eviction_result) return tl::make_unexpected(eviction_result.error());
 
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadata;
-    const std::string endpoint =
-        EnvString("MOONCAKE_MEMORY_POOL_TRANSPORT_ENDPOINT");
+    std::vector<std::pair<std::string, Allocation>> created;
 
     for (const auto& [key, slices] : objects) {
         uint64_t total = 0;
@@ -272,7 +193,14 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         if (!total) continue;
 
         auto allocation = Allocate(total);
-        if (!allocation) continue;
+        if (!allocation) {
+            for (const auto& [created_key, created_allocation] : created) {
+                (void)Free(created_allocation);
+                std::lock_guard<std::mutex> lock(mutex_);
+                entries_.erase(created_key);
+            }
+            return tl::make_unexpected(allocation.error());
+        }
 
         uint64_t offset = 0;
         bool ok = true;
@@ -286,26 +214,42 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
         }
         if (!ok) {
             (void)Free(allocation.value());
-            continue;
+            for (const auto& [created_key, created_allocation] : created) {
+                (void)Free(created_allocation);
+                std::lock_guard<std::mutex> lock(mutex_);
+                entries_.erase(created_key);
+            }
+            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            entries_[key] = Entry{allocation.value(),
-                                  next_sequence_.fetch_add(1), true};
+            entries_.emplace(key, Entry{allocation.value()});
         }
-        used_bytes_.fetch_add(allocation.value().size,
-                              std::memory_order_relaxed);
+        created.emplace_back(key, allocation.value());
         keys.push_back(key);
+
+        // StorageObjectMetadata is a Store-wide compatibility structure.  The
+        // authoritative Memory Pool descriptor remains in entries_ in CPU DRAM;
+        // no filesystem or persistent-storage metadata is created here.
         metadata.push_back(StorageObjectMetadata{
+            static_cast<int64_t>(allocation.value().node_id),
+            static_cast<int64_t>(allocation.value().global_addr),
             static_cast<int64_t>(allocation.value().handle),
-            static_cast<int64_t>(allocation.value().global_addr), 0,
-            static_cast<int64_t>(total), endpoint});
+            static_cast<int64_t>(total),
+            ""});
     }
 
     if (complete && !keys.empty()) {
         auto result = complete(keys, metadata);
-        if (result != ErrorCode::OK) return tl::make_unexpected(result);
+        if (result != ErrorCode::OK) {
+            for (const auto& [created_key, created_allocation] : created) {
+                (void)Free(created_allocation);
+                std::lock_guard<std::mutex> lock(mutex_);
+                entries_.erase(created_key);
+            }
+            return tl::make_unexpected(result);
+        }
     }
     return static_cast<int64_t>(keys.size());
 }
@@ -317,19 +261,19 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::BatchLoad(
     }
 
     for (auto& [key, dst] : objects) {
-        Entry entry;
+        Allocation allocation;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = entries_.find(key);
             if (it == entries_.end()) {
                 return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
             }
-            entry = it->second;
+            allocation = it->second.allocation;
         }
-        if (dst.size > entry.allocation.size) {
+        if (dst.size > allocation.size) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        auto result = TransferPoolToD(dst, entry.allocation, 0);
+        auto result = TransferPoolToD(dst, allocation, 0);
         if (!result) return result;
     }
     return {};
@@ -350,8 +294,6 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::ScanMeta(
                                   std::vector<StorageObjectMetadata>&)>& handler) {
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadata;
-    const std::string endpoint =
-        EnvString("MOONCAKE_MEMORY_POOL_TRANSPORT_ENDPOINT");
     {
         std::lock_guard<std::mutex> lock(mutex_);
         keys.reserve(entries_.size());
@@ -359,9 +301,11 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::ScanMeta(
         for (const auto& [key, entry] : entries_) {
             keys.push_back(key);
             metadata.push_back(StorageObjectMetadata{
+                static_cast<int64_t>(entry.allocation.node_id),
+                static_cast<int64_t>(entry.allocation.global_addr),
                 static_cast<int64_t>(entry.allocation.handle),
-                static_cast<int64_t>(entry.allocation.global_addr), 0,
-                static_cast<int64_t>(entry.allocation.size), endpoint});
+                static_cast<int64_t>(entry.allocation.size),
+                ""});
         }
     }
     if (handler && !keys.empty()) {
@@ -372,67 +316,17 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::ScanMeta(
 }
 
 void MemoryPoolStorageBackend::RemoveAll() {
-    std::vector<Allocation> local_allocations;
+    std::vector<Allocation> allocations;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        allocations.reserve(entries_.size());
         for (const auto& [key, entry] : entries_) {
-            if (entry.local_owner) local_allocations.push_back(entry.allocation);
+            (void)key;
+            allocations.push_back(entry.allocation);
         }
         entries_.clear();
-        used_bytes_.store(0, std::memory_order_relaxed);
     }
-    for (const auto& allocation : local_allocations) (void)Free(allocation);
-}
-
-tl::expected<std::vector<std::string>, ErrorCode>
-MemoryPoolStorageBackend::EvictAboveDiskWatermark(
-    double high, double low, EvictionHandler handler) {
-    if (high <= 0 || low < 0 || low >= high) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const uint64_t target = static_cast<uint64_t>(capacity_ * low);
-    std::vector<std::string> evicted;
-    while (used_bytes_.load(std::memory_order_relaxed) > target) {
-        Entry victim;
-        std::string key;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = std::find_if(entries_.begin(), entries_.end(),
-                                   [](const auto& item) {
-                                       return item.second.local_owner;
-                                   });
-            if (it == entries_.end()) break;
-            for (auto candidate = entries_.begin(); candidate != entries_.end();
-                 ++candidate) {
-                if (candidate->second.local_owner &&
-                    candidate->second.sequence < it->second.sequence) {
-                    it = candidate;
-                }
-            }
-            key = it->first;
-            victim = it->second;
-        }
-
-        if (handler) {
-            auto result = handler({key});
-            if (!result) return tl::make_unexpected(result.error());
-        }
-        auto free_result = Free(victim.allocation);
-        if (!free_result) return tl::make_unexpected(free_result.error());
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = entries_.find(key);
-            if (it != entries_.end() && it->second.sequence == victim.sequence) {
-                used_bytes_.fetch_sub(it->second.allocation.size,
-                                      std::memory_order_relaxed);
-                entries_.erase(it);
-            }
-        }
-        evicted.push_back(key);
-    }
-    return evicted;
+    for (const auto& allocation : allocations) (void)Free(allocation);
 }
 
 }  // namespace mooncake
