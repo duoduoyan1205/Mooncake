@@ -48,21 +48,13 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
-    // Explicit GPU-to-GPU paths exposed to the upper Mooncake data plane.
     tl::expected<void, ErrorCode> TransferPToD(const Slice& src, const Slice& dst);
     tl::expected<void, ErrorCode> TransferDToP(const Slice& src, const Slice& dst);
-
-    // Explicit Memory Pool paths. These operate on the allocation descriptor
-    // obtained from the Memory Pool replica metadata, so a Decode node does
-    // not need a locally-created allocation entry before Pool -> GPU.
     tl::expected<void, ErrorCode> TransferDToPool(
         const Slice& src, const Allocation& allocation, uint64_t offset = 0);
     tl::expected<void, ErrorCode> TransferPoolToD(
         const Slice& dst, const Allocation& allocation, uint64_t offset = 0);
 
-    // Register/unregister a remote allocation learned from Master metadata.
-    // The allocation is intentionally not freed here: ownership belongs to
-    // the Memory Pool node that created it.
     tl::expected<void, ErrorCode> RegisterRemoteAllocation(
         const std::string& key, const Allocation& allocation);
     tl::expected<void, ErrorCode> UnregisterRemoteAllocation(
@@ -87,13 +79,13 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
     tl::expected<void, ErrorCode> TransferGpuToGpu(const Slice& src,
                                                    const Slice& dst,
                                                    uint32_t path);
-    tl::expected<void*, ErrorCode> MapAllocation(const Allocation& allocation);
-    void UnmapAllocation(void* address, uint64_t size);
     bool LooksLikeDevicePointer(const void* ptr) const;
     tl::expected<void, ErrorCode> EvictForSpace(
         uint64_t required_size, EvictionHandler eviction_handler);
 
-    int fd_ = -1;
+    void* sueverbs_handle_ = nullptr;
+    void* sueverbs_ctx_ = nullptr;
+    std::string sueverbs_library_;
     std::string device_path_;
     uint64_t capacity_ = 0;
     std::atomic<uint64_t> used_bytes_{0};
