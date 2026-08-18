@@ -1,12 +1,9 @@
 #include "memory_pool_transfer_engine.h"
 
-#include <algorithm>
-#include <cstdlib>
-#include <dlfcn.h>
 #include <cerrno>
+#include <dlfcn.h>
 #include <string>
-
-#include "device/accelerator_registry.h"
+#include <utility>
 
 namespace mooncake {
 namespace {
@@ -165,12 +162,11 @@ int MemoryPoolTransferEngine::Transfer(AccessPath path, uint64_t source_addr,
                                        uint64_t target_addr, size_t length) {
     if (!ctx_ || !length) return -EINVAL;
     int status = 0;
-    return api_->submit_and_wait(
+    const int rc = api_->submit_and_wait(
         reinterpret_cast<amdgpu_mpu_ctx*>(ctx_),
         static_cast<amdgpu_mpu_path>(static_cast<uint32_t>(path)), source_addr,
-        target_addr, length, kXferSignal | kXferOrdered, kTimeoutNs, &status) == 0
-               ? status
-               : -EIO;
+        target_addr, length, kXferSignal | kXferOrdered, kTimeoutNs, &status);
+    return rc == 0 ? status : -EIO;
 }
 
 int MemoryPoolTransferEngine::TransferPToD(uint64_t source_addr,
@@ -191,13 +187,6 @@ int MemoryPoolTransferEngine::TransferDToPool(uint64_t source_addr,
 int MemoryPoolTransferEngine::TransferPoolToD(uint64_t pool_addr,
                                               uint64_t target_addr, size_t length) {
     return Transfer(AccessPath::kPoolToD, pool_addr, target_addr, length);
-}
-
-bool MemoryPoolTransferEngine::LooksLikeDevicePointer(const void* ptr) const {
-    if (!ptr) return false;
-    auto& registry = device::GetAcceleratorRegistry().RuntimeAccelerators();
-    device::PointerInfo info{};
-    return registry.FindDeviceForPointer(const_cast<void*>(ptr), &info) != nullptr;
 }
 
 }  // namespace mooncake
