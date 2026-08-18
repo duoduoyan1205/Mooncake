@@ -9,7 +9,9 @@
 namespace mooncake {
 namespace {
 std::string DevicePath() {
-    const char* p = std::getenv("MOONCAKE_MEMORY_POOL_DEVICE");
+    const char* p = std::getenv("MOONCAKE_MEMORY_POOL_DEVICES");
+    if (p && *p) return p;
+    p = std::getenv("MOONCAKE_MEMORY_POOL_DEVICE");
     return p && *p ? p : "/dev/amdgpu-mpu";
 }
 
@@ -74,12 +76,12 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferGpuToGpu(
     switch (path) {
         case MemoryPoolAccessPath::kPToD:
             rc = transfer_engine_->TransferPToD(
-                reinterpret_cast<uint64_t>(src.ptr),
+                0, reinterpret_cast<uint64_t>(src.ptr),
                 reinterpret_cast<uint64_t>(dst.ptr), src.size);
             break;
         case MemoryPoolAccessPath::kDToP:
             rc = transfer_engine_->TransferDToP(
-                reinterpret_cast<uint64_t>(src.ptr),
+                0, reinterpret_cast<uint64_t>(src.ptr),
                 reinterpret_cast<uint64_t>(dst.ptr), src.size);
             break;
         default:
@@ -108,13 +110,13 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Transfer(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const uint64_t pool_addr = allocation.global_addr + offset;
-    const uint64_t gpu_addr = reinterpret_cast<uint64_t>(slice.ptr);
     const int rc = to_pool
                        ? transfer_engine_->TransferDToPool(
-                             gpu_addr, pool_addr, slice.size)
+                             allocation, reinterpret_cast<uint64_t>(slice.ptr),
+                             slice.size, offset)
                        : transfer_engine_->TransferPoolToD(
-                             pool_addr, gpu_addr, slice.size);
+                             allocation, reinterpret_cast<uint64_t>(slice.ptr),
+                             slice.size, offset);
     if (rc != 0) {
         return tl::make_unexpected(to_pool ? ErrorCode::FILE_WRITE_FAIL
                                            : ErrorCode::FILE_READ_FAIL);
@@ -244,9 +246,8 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Init() {
 
 tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& objects,
-    std::function<ErrorCode(
-        const std::vector<std::string>&,
-        std::vector<StorageObjectMetadata>&)> complete,
+    std::function<ErrorCode(const std::vector<std::string>&,
+                            std::vector<StorageObjectMetadata>&)> complete,
     EvictionHandler handler) {
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -345,9 +346,8 @@ tl::expected<bool, ErrorCode> MemoryPoolStorageBackend::IsEnableOffloading() {
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::ScanMeta(
-    const std::function<ErrorCode(
-        const std::vector<std::string>&,
-        std::vector<StorageObjectMetadata>&)>& handler) {
+    const std::function<ErrorCode(const std::vector<std::string>&,
+                                  std::vector<StorageObjectMetadata>&)>& handler) {
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadata;
     const std::string endpoint =
@@ -366,9 +366,7 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::ScanMeta(
     }
     if (handler && !keys.empty()) {
         auto result = handler(keys, metadata);
-        if (result != ErrorCode::OK) {
-            return tl::make_unexpected(result);
-        }
+        if (result != ErrorCode::OK) return tl::make_unexpected(result);
     }
     return {};
 }
@@ -383,11 +381,7 @@ void MemoryPoolStorageBackend::RemoveAll() {
         entries_.clear();
         used_bytes_.store(0, std::memory_order_relaxed);
     }
-    for (const auto& allocation : local_allocations) {
-        (void)Free(allocation);
-    }
-    if (transfer_engine_) transfer_engine_->Close();
-    initialized_.store(false, std::memory_order_release);
+    for (const auto& allocation : local_allocations) (void)Free(allocation);
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
