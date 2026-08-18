@@ -50,8 +50,6 @@ class MemoryPoolTransferEngine {
     int TransferDToPool(uint64_t source_addr, uint64_t pool_addr, size_t length);
     int TransferPoolToD(uint64_t pool_addr, uint64_t target_addr, size_t length);
 
-    bool LooksLikeDevicePointer(const void* ptr) const;
-
  private:
     struct Context;
     struct Api;
