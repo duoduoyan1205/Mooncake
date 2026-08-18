@@ -1,0 +1,81 @@
+name: apply-memory-pool-replica-model
+
+on:
+  pull_request:
+    branches: [mpu-patch-base]
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.pull_request.head.ref == 'mooncakempu-clean' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mooncakempu-clean
+          fetch-depth: 1
+      - name: Patch replica model
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path); s = p.read_text()
+              if s.count(old) != 1:
+                  raise SystemExit(f'{path}: expected exactly one occurrence, got {s.count(old)} for {old!r}')
+              p.write_text(s.replace(old, new, 1))
+
+          replace_once('mooncake-store/include/allocator.h',
+                       '    ALL,         // All memory and NoF replicas in put finalize path\n};',
+                       '    ALL,         // All memory and NoF replicas in put finalize path\n    MEMORY_POOL, // SUE Memory Pool replica\n};')
+
+          p = Path('mooncake-store/include/replica.h'); s = p.read_text()
+          replace_once('mooncake-store/include/replica.h',
+                       '                             {ReplicaType::ALL, "ALL"}};',
+                       '                             {ReplicaType::ALL, "ALL"},\n                             {ReplicaType::MEMORY_POOL, "MEMORY_POOL"}};')
+          replace_once('mooncake-store/include/replica.h',
+                       'struct LocalDiskReplicaData {\n    UUID client_id;\n    uint64_t object_size = 0;\n    std::string transport_endpoint;\n};',
+                       'struct LocalDiskReplicaData {\n    UUID client_id;\n    uint64_t object_size = 0;\n    std::string transport_endpoint;\n};\n\nstruct MemoryPoolReplicaData {\n    uint64_t allocation_handle = 0;\n    uint64_t global_address = 0;\n    uint64_t object_size = 0;\n    std::string node_id;\n    std::string transport_endpoint;\n};')
+          replace_once('mooncake-store/include/replica.h',
+                       'struct LocalDiskDescriptor {\n    UUID client_id;\n    uint64_t object_size = 0;\n    std::string transport_endpoint;\n    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);\n};',
+                       'struct LocalDiskDescriptor {\n    UUID client_id;\n    uint64_t object_size = 0;\n    std::string transport_endpoint;\n    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);\n};\n\nstruct MemoryPoolDescriptor {\n    uint64_t allocation_handle = 0;\n    uint64_t global_address = 0;\n    uint64_t object_size = 0;\n    std::string node_id;\n    std::string transport_endpoint;\n    YLT_REFL(MemoryPoolDescriptor, allocation_handle, global_address,\n             object_size, node_id, transport_endpoint);\n};')
+          replace_once('mooncake-store/include/replica.h',
+                       '    // disk replica constructor\n    Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)',
+                       '    // memory pool replica constructor\n    Replica(uint64_t allocation_handle, uint64_t global_address,\n            uint64_t object_size, std::string node_id,\n            std::string transport_endpoint, ReplicaStatus status)\n        : id_(next_id_.fetch_add(1)),\n          data_(MemoryPoolReplicaData{allocation_handle, global_address,\n                                       object_size, std::move(node_id),\n                                       std::move(transport_endpoint)}),\n          status_(status),\n          refcnt_(0) {}\n\n    // disk replica constructor\n    Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)')
+          replace_once('mooncake-store/include/replica.h',
+                       '    [[nodiscard]] bool is_local_disk_replica() const {\n        return std::holds_alternative<LocalDiskReplicaData>(data_);\n    }',
+                       '    [[nodiscard]] bool is_local_disk_replica() const {\n        return std::holds_alternative<LocalDiskReplicaData>(data_);\n    }\n\n    [[nodiscard]] bool is_memory_pool_replica() const {\n        return std::holds_alternative<MemoryPoolReplicaData>(data_);\n    }\n\n    [[nodiscard]] static bool fn_is_memory_pool_replica(const Replica& replica) {\n        return replica.is_memory_pool_replica();\n    }')
+          replace_once('mooncake-store/include/replica.h',
+                       '        ReplicaType operator()(const LocalDiskReplicaData&) const {\n            return ReplicaType::LOCAL_DISK;\n        }\n    };',
+                       '        ReplicaType operator()(const LocalDiskReplicaData&) const {\n            return ReplicaType::LOCAL_DISK;\n        }\n        ReplicaType operator()(const MemoryPoolReplicaData&) const {\n            return ReplicaType::MEMORY_POOL;\n        }\n    };')
+          replace_once('mooncake-store/include/replica.h',
+                       '        std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,\n                     LocalDiskDescriptor>\n            descriptor_variant;',
+                       '        std::variant<MemoryDescriptor, NoFDescriptor, DiskDescriptor,\n                     LocalDiskDescriptor, MemoryPoolDescriptor>\n            descriptor_variant;')
+          replace_once('mooncake-store/include/replica.h',
+                       '        bool is_local_disk_replica() const noexcept {\n            return std::holds_alternative<LocalDiskDescriptor>(\n                descriptor_variant);\n        }',
+                       '        bool is_local_disk_replica() const noexcept {\n            return std::holds_alternative<LocalDiskDescriptor>(\n                descriptor_variant);\n        }\n\n        bool is_memory_pool_replica() const noexcept {\n            return std::holds_alternative<MemoryPoolDescriptor>(\n                descriptor_variant);\n        }')
+          replace_once('mooncake-store/include/replica.h',
+                       '        const LocalDiskDescriptor& get_local_disk_descriptor() const {\n            if (auto* desc =\n                    std::get_if<LocalDiskDescriptor>(&descriptor_variant)) {\n                return *desc;\n            }\n            throw std::runtime_error("Expected LocalDiskDescriptor");\n        }',
+                       '        const LocalDiskDescriptor& get_local_disk_descriptor() const {\n            if (auto* desc =\n                    std::get_if<LocalDiskDescriptor>(&descriptor_variant)) {\n                return *desc;\n            }\n            throw std::runtime_error("Expected LocalDiskDescriptor");\n        }\n\n        MemoryPoolDescriptor& get_memory_pool_descriptor() {\n            if (auto* desc = std::get_if<MemoryPoolDescriptor>(&descriptor_variant)) {\n                return *desc;\n            }\n            throw std::runtime_error("Expected MemoryPoolDescriptor");\n        }\n\n        const MemoryPoolDescriptor& get_memory_pool_descriptor() const {\n            if (auto* desc = std::get_if<MemoryPoolDescriptor>(&descriptor_variant)) {\n                return *desc;\n            }\n            throw std::runtime_error("Expected MemoryPoolDescriptor");\n        }')
+          replace_once('mooncake-store/include/replica.h',
+                       '    std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,\n                 LocalDiskReplicaData>\n        data_;',
+                       '    std::variant<MemoryReplicaData, NoFReplicaData, DiskReplicaData,\n                 LocalDiskReplicaData, MemoryPoolReplicaData>\n        data_;')
+          replace_once('mooncake-store/include/replica.h',
+                       '    } else if (is_local_disk_replica()) {\n        const auto& disk_data = std::get<LocalDiskReplicaData>(data_);\n        LocalDiskDescriptor local_disk_desc;\n        local_disk_desc.client_id = disk_data.client_id;\n        local_disk_desc.object_size = disk_data.object_size;\n        local_disk_desc.transport_endpoint = disk_data.transport_endpoint;\n        desc.descriptor_variant = std::move(local_disk_desc);\n    }',
+                       '    } else if (is_local_disk_replica()) {\n        const auto& disk_data = std::get<LocalDiskReplicaData>(data_);\n        LocalDiskDescriptor local_disk_desc;\n        local_disk_desc.client_id = disk_data.client_id;\n        local_disk_desc.object_size = disk_data.object_size;\n        local_disk_desc.transport_endpoint = disk_data.transport_endpoint;\n        desc.descriptor_variant = std::move(local_disk_desc);\n    } else if (is_memory_pool_replica()) {\n        const auto& pool_data = std::get<MemoryPoolReplicaData>(data_);\n        MemoryPoolDescriptor pool_desc;\n        pool_desc.allocation_handle = pool_data.allocation_handle;\n        pool_desc.global_address = pool_data.global_address;\n        pool_desc.object_size = pool_data.object_size;\n        pool_desc.node_id = pool_data.node_id;\n        pool_desc.transport_endpoint = pool_data.transport_endpoint;\n        desc.descriptor_variant = std::move(pool_desc);\n    }')
+          replace_once('mooncake-store/include/replica.h',
+                       '    } else if (replica.is_disk_replica()) {\n        const auto& disk_data = std::get<DiskReplicaData>(replica.data_);\n        os << "type: DISK, file_path: " << disk_data.file_path\n           << ", object_size: " << disk_data.object_size;\n    }',
+                       '    } else if (replica.is_disk_replica()) {\n        const auto& disk_data = std::get<DiskReplicaData>(replica.data_);\n        os << "type: DISK, file_path: " << disk_data.file_path\n           << ", object_size: " << disk_data.object_size;\n    } else if (replica.is_memory_pool_replica()) {\n        const auto& pool_data = std::get<MemoryPoolReplicaData>(replica.data_);\n        os << "type: MEMORY_POOL, global_address: " << pool_data.global_address\n           << ", object_size: " << pool_data.object_size;\n    }')
+
+          Path('.github/workflows/apply-memory-pool-replica-model.yml').unlink()
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mooncake-store .github/workflows/apply-memory-pool-replica-model.yml
+          git diff --cached --check
+          git commit -m "feat(store): add memory pool replica model"
+          git push origin mooncakempu-clean
