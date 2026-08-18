@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <vector>
 
 namespace mooncake {
 
@@ -31,8 +30,8 @@ class MemoryPoolTransferEngine {
     MemoryPoolTransferEngine(const MemoryPoolTransferEngine&) = delete;
     MemoryPoolTransferEngine& operator=(const MemoryPoolTransferEngine&) = delete;
 
-    // device_paths is a comma-separated list. Each device is treated as one
-    // equivalent Memory Pool node. Placement is intentionally round-robin.
+    // device_paths is a comma-separated list. Each device is one equivalent
+    // Memory Pool node. Placement is intentionally round-robin.
     int Open();
     void Close();
 
@@ -58,12 +57,6 @@ class MemoryPoolTransferEngine {
 
  private:
     struct Context;
-    struct Api;
-    struct Node;
-
-    int LoadApi();
-    void UnloadApi();
-
     std::unique_ptr<Context> context_;
 };
 
