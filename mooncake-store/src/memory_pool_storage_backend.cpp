@@ -56,7 +56,10 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Free(
 }
 
 bool MemoryPoolStorageBackend::LooksLikeDevicePointer(const void* ptr) const {
-    return transfer_engine_ && transfer_engine_->LooksLikeDevicePointer(ptr);
+    if (!ptr) return false;
+    auto& registry = device::GetAcceleratorRegistry().RuntimeAccelerators();
+    device::PointerInfo info{};
+    return registry.FindDeviceForPointer(const_cast<void*>(ptr), &info) != nullptr;
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferGpuToGpu(
