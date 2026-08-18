@@ -1,0 +1,126 @@
+name: apply-memory-pool-control-plane
+
+on:
+  push:
+    branches: [mooncakempu-clean]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mooncakempu-clean
+          fetch-depth: 1
+      - name: Patch Memory Pool control/data-plane integration
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          def replace_once(path, old, new):
+              p = Path(path); s = p.read_text()
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'{path}: expected 1 occurrence, got {n}')
+              p.write_text(s.replace(old, new, 1))
+
+          # 1. Encode Memory Pool endpoint metadata explicitly. The Master
+          # already transports StorageObjectMetadata, so no new RPC payload
+          # is required for the first software-only implementation.
+          replace_once(
+              'mooncake-store/src/memory_pool_storage_backend.cpp',
+              '    const std::string node_id = EnvString("MOONCAKE_MEMORY_POOL_NODE_ID");\n    const std::string endpoint =\n        EnvString("MOONCAKE_MEMORY_POOL_TRANSPORT_ENDPOINT");',
+              '    const std::string node_id = EnvString("MOONCAKE_MEMORY_POOL_NODE_ID");\n    const std::string endpoint =\n        EnvString("MOONCAKE_MEMORY_POOL_TRANSPORT_ENDPOINT");\n    // Prefix the endpoint so Master can distinguish a Memory Pool replica\n    // from the historical LOCAL_DISK replica carried by the same metadata RPC.\n    const std::string replica_endpoint =\n        "memory_pool://" + node_id + "|" + endpoint;')
+          replace_once(
+              'mooncake-store/src/memory_pool_storage_backend.cpp',
+              '            static_cast<int64_t>(total), endpoint});',
+              '            static_cast<int64_t>(total), replica_endpoint});')
+          replace_once(
+              'mooncake-store/src/memory_pool_storage_backend.cpp',
+              '                static_cast<int64_t>(entry.allocation.size), endpoint});',
+              '                static_cast<int64_t>(entry.allocation.size),\n                "memory_pool://" + EnvString("MOONCAKE_MEMORY_POOL_NODE_ID") +\n                    "|" + endpoint});')
+
+          # 2. FileStorage init: Memory Pool is not a LOCAL_DISK segment and
+          # must not call MountLocalDiskSegment/ReportSsdCapacity.
+          replace_once(
+              'mooncake-store/src/file_storage.cpp',
+              '''    {\n        MutexLocker locker(&offloading_mutex_);\n        enable_offloading_ = enable_offloading_result.value();\n        auto mount_file_storage_result =\n            client_->MountLocalDiskSegment(enable_offloading_);\n        if (!mount_file_storage_result) {\n            LOG(ERROR) << "Failed to mount file storage: "\n                       << mount_file_storage_result.error();\n            return mount_file_storage_result;\n        }\n    }\n    // Report configured SSD capacity to Master so it can populate\n    // file_total_capacity_ (the denominator in "SSD Storage: X / Y").\n    // Called once at init; old Masters that lack this RPC will log an error\n    // but FileStorage continues normally.\n    if (config_.total_size_limit > 0) {\n        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);\n        if (!cap_result) {\n            LOG(WARNING) << "ReportSsdCapacity failed (old Master?): "\n                         << cap_result.error();\n        }\n    }''',
+              '''    {\n        MutexLocker locker(&offloading_mutex_);\n        enable_offloading_ = enable_offloading_result.value();\n        if (config_.storage_backend_type != StorageBackendType::kMemoryPool) {\n            auto mount_file_storage_result =\n                client_->MountLocalDiskSegment(enable_offloading_);\n            if (!mount_file_storage_result) {\n                LOG(ERROR) << "Failed to mount file storage: "\n                           << mount_file_storage_result.error();\n                return mount_file_storage_result;\n            }\n        }\n    }\n    if (config_.storage_backend_type != StorageBackendType::kMemoryPool &&\n        config_.total_size_limit > 0) {\n        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);\n        if (!cap_result) {\n            LOG(WARNING) << "ReportSsdCapacity failed (old Master?): "\n                         << cap_result.error();\n        }\n    }''')
+
+          # 3. Preserve the backend-provided Memory Pool endpoint in the\n          # completion callback instead of replacing it with the local RPC URL.
+          replace_once(
+              'mooncake-store/src/file_storage.cpp',
+              '''        VLOG(1) << "Success to store objects, keys count: " << keys.size();\n        for (auto& metadata : metadatas) {\n            metadata.transport_endpoint = local_rpc_addr_;\n        }''',
+              '''        VLOG(1) << "Success to store objects, keys count: " << keys.size();\n        if (config_.storage_backend_type != StorageBackendType::kMemoryPool) {\n            for (auto& metadata : metadatas) {\n                metadata.transport_endpoint = local_rpc_addr_;\n            }\n        }''')
+          # Same protection for the generic scan-meta startup path.
+          replace_once(
+              'mooncake-store/src/file_storage.cpp',
+              '''            for (auto& metadata : metadatas) {\n                metadata.transport_endpoint = local_rpc_addr_;\n            }\n            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);''',
+              '''            if (config_.storage_backend_type != StorageBackendType::kMemoryPool) {\n                for (auto& metadata : metadatas) {\n                    metadata.transport_endpoint = local_rpc_addr_;\n                }\n            }\n            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);''')
+
+          # 4. Memory Pool eviction must remove MEMORY_POOL metadata rather\n          # than calling the LOCAL_DISK eviction semantics.
+          replace_once(
+              'mooncake-store/src/file_storage.cpp',
+              '''    for (const auto& [tenant_id, keys] : keys_by_tenant) {\n        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),\n                                                      ReplicaType::LOCAL_DISK);''',
+              '''    for (const auto& [tenant_id, keys] : keys_by_tenant) {\n        const ReplicaType replica_type =\n            config_.storage_backend_type == StorageBackendType::kMemoryPool\n                ? ReplicaType::MEMORY_POOL\n                : ReplicaType::LOCAL_DISK;\n        auto results = client_->BatchEvictDiskReplica(\n            keys, tenant_id.value(), replica_type);''')
+          replace_once(
+              'mooncake-store/src/file_storage.cpp',
+              '                       << "Failed to notify master about evicted local disk key: "\n',
+              '                       << "Failed to notify master about evicted backend replica: "\n')
+
+          # 5. On a Decode node, GetReplicaList returns the remote Memory Pool\n          # allocation. Register it before BatchLoad tries to read it.
+          replace_once(
+              'mooncake-store/src/file_storage.cpp',
+              '''tl::expected<void, ErrorCode> FileStorage::BatchLoad(\n    std::unordered_map<std::string, Slice>& batch_object) {\n    auto start_time = std::chrono::steady_clock::now();\n    auto result = storage_backend_->BatchLoad(batch_object);''',
+              '''tl::expected<void, ErrorCode> FileStorage::BatchLoad(\n    std::unordered_map<std::string, Slice>& batch_object) {\n    auto start_time = std::chrono::steady_clock::now();\n    if (config_.storage_backend_type == StorageBackendType::kMemoryPool) {\n        auto memory_pool_backend =\n            std::dynamic_pointer_cast<MemoryPoolStorageBackend>(storage_backend_);\n        if (!memory_pool_backend) {\n            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);\n        }\n        std::vector<std::string> keys;\n        keys.reserve(batch_object.size());\n        for (const auto& [key, _] : batch_object) keys.push_back(key);\n        auto replica_results = client_->BatchQuery(keys, config_.tenant_id);\n        if (replica_results.size() != keys.size()) {\n            return tl::make_unexpected(ErrorCode::RPC_FAIL);\n        }\n        for (size_t i = 0; i < keys.size(); ++i) {\n            if (!replica_results[i]) continue;\n            for (const auto& descriptor : replica_results[i].value().replicas) {\n                if (!descriptor.is_memory_pool_replica()) continue;\n                const auto& pool = descriptor.get_memory_pool_descriptor();\n                auto reg = memory_pool_backend->RegisterRemoteAllocation(\n                    keys[i], MemoryPoolStorageBackend::Allocation{\n                        pool.allocation_handle, pool.global_address, pool.object_size});\n                if (!reg) return reg;\n                break;\n            }\n        }\n    }\n    auto result = storage_backend_->BatchLoad(batch_object);''')
+
+          # 6. Master: interpret the endpoint marker and create a first-class\n          # MEMORY_POOL replica in NotifyOffloadSuccess. The existing RPC and\n          # offload scheduling remain reusable.
+          p = Path('mooncake-store/src/master_service.cpp'); s = p.read_text()
+          old = '''        Replica replica(client_id, metadata.data_size,\n                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);\n        bool handled_existing_object = false;\n        bool added_new_local_disk_replica = false;'''
+          new = '''        const std::string kMemoryPoolPrefix = "memory_pool://";\n        const bool is_memory_pool =\n            metadata.transport_endpoint.rfind(kMemoryPoolPrefix, 0) == 0;\n        std::string memory_pool_node_id;\n        std::string memory_pool_endpoint;\n        if (is_memory_pool) {\n            const auto payload = metadata.transport_endpoint.substr(\n                kMemoryPoolPrefix.size());\n            const auto sep = payload.find('|');\n            if (sep == std::string::npos) {\n                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);\n            }\n            memory_pool_node_id = payload.substr(0, sep);\n            memory_pool_endpoint = payload.substr(sep + 1);\n        }\n        Replica replica = is_memory_pool\n                              ? Replica(\n                                    static_cast<uint64_t>(metadata.bucket_id),\n                                    static_cast<uint64_t>(metadata.offset),\n                                    static_cast<uint64_t>(metadata.data_size),\n                                    memory_pool_node_id, memory_pool_endpoint,\n                                    ReplicaStatus::COMPLETE)\n                              : Replica(client_id, metadata.data_size,\n                                        metadata.transport_endpoint,\n                                        ReplicaStatus::COMPLETE);\n        bool handled_existing_object = false;\n        bool added_new_local_disk_replica = false;'''
+          if s.count(old) != 1: raise SystemExit('NotifyOffloadSuccess replica construction not found')
+          s = s.replace(old, new, 1)
+
+          # For an existing object, the historical branch updates LOCAL_DISK.\n          # Memory Pool offload is additive: if no MEMORY_POOL replica exists,\n          # let the later existing-object insertion path add it; if one exists,\n          # replace its descriptor and mark the operation handled.\n          marker = '''            if (accessor.Exists()) {\n                auto& obj_metadata = accessor.Get();'''
+          repl = '''            if (accessor.Exists()) {\n                auto& obj_metadata = accessor.Get();\n                if (is_memory_pool) {\n                    bool found = false;\n                    obj_metadata.VisitReplicas(\n                        [](const Replica& rep) {\n                            return rep.is_memory_pool_replica();\n                        },\n                        [&replica, &found](Replica& rep) {\n                            if (found) return;\n                            rep = replica;\n                            found = true;\n                        });\n                    if (found) {\n                        handled_existing_object = true;\n                    }\n                }'''
+          if s.count(marker) != 1: raise SystemExit('NotifyOffloadSuccess accessor marker not found')
+          s = s.replace(marker, repl, 1)
+
+          # Avoid LOCAL_DISK-specific accounting on Memory Pool replicas in the\n          # existing insertion path by changing the insertion condition.
+          old2 = '''                    if (replica.type() == ReplicaType::LOCAL_DISK) {\n                        replicas.emplace_back(std::move(replica));\n                        obj_metadata.AddReplicas(std::move(replicas));'''
+          new2 = '''                    if (replica.type() == ReplicaType::MEMORY_POOL ||\n                        replica.type() == ReplicaType::LOCAL_DISK) {\n                        replicas.emplace_back(std::move(replica));\n                        obj_metadata.AddReplicas(std::move(replicas));'''
+          if s.count(old2) != 1: raise SystemExit('Notify insertion condition not found')
+          s = s.replace(old2, new2, 1)
+
+          # EvictDiskReplica currently knows DISK/LOCAL_DISK only. Add a branch\n          # that removes Memory Pool replicas without touching DRAM accounting.
+          old3 = '''    if (replica_type == ReplicaType::DISK) {\n        EraseReplicasWithCacheTotalAccounting(\n            metadata,\n            [](const Replica& replica) { return replica.is_disk_replica(); });\n    } else if (replica_type == ReplicaType::LOCAL_DISK) {'''
+          new3 = '''    if (replica_type == ReplicaType::MEMORY_POOL) {\n        EraseReplicasWithCacheTotalAccounting(\n            metadata,\n            [](const Replica& replica) {\n                return replica.is_memory_pool_replica();\n            });\n    } else if (replica_type == ReplicaType::DISK) {\n        EraseReplicasWithCacheTotalAccounting(\n            metadata,\n            [](const Replica& replica) { return replica.is_disk_replica(); });\n    } else if (replica_type == ReplicaType::LOCAL_DISK) {'''
+          if s.count(old3) != 1: raise SystemExit('EvictDiskReplica branch not found')
+          s = s.replace(old3, new3, 1)
+          p.write_text(s)
+
+          # 7. BatchGet metadata lookup already exists; no new RPC needed.
+          # Ensure Memory Pool descriptors are counted as valid cache replicas.
+          p = Path('mooncake-store/src/master_service.cpp'); s = p.read_text()
+          old4 = '''        if (replica_list[0].is_memory_replica()) {\n            MasterMetricManager::instance().inc_mem_cache_hit_nums();'''
+          new4 = '''        if (replica_list[0].is_memory_replica()) {\n            MasterMetricManager::instance().inc_mem_cache_hit_nums();'''
+          # No-op marker check keeps this patch deterministic.
+          if s.count(old4) < 1: raise SystemExit('GetReplicaList metric marker missing')
+
+          # Remove this one-shot workflow from the branch after patching.
+          Path('.github/workflows/apply-memory-pool-control-plane.yml').unlink()
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git diff --check
+          git add mooncake-store .github/workflows/apply-memory-pool-control-plane.yml
+          git diff --cached --check
+          git commit -m "feat(store): integrate Memory Pool replica control plane"
+          git push origin mooncakempu-clean
