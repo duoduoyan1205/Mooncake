@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <string>
 
-#include "environ.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -15,11 +14,17 @@ namespace mooncake {
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackendLegacy(const FileStorageConfig& config);
 
+namespace {
+std::string GetBackendDescriptor() {
+    const char* value =
+        std::getenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR");
+    return value != nullptr ? value : "";
+}
+}  // namespace
+
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config) {
-    const auto descriptor = Environ::GetString(
-        "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "");
-    if (descriptor == "memory_pool_storage_backend") {
+    if (GetBackendDescriptor() == "memory_pool_storage_backend") {
         return std::make_shared<MemoryPoolStorageBackend>(config);
     }
     return CreateStorageBackendLegacy(config);
