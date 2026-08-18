@@ -56,6 +56,8 @@ class MemoryPoolTransferEngine {
                         size_t length, uint64_t offset = 0);
 
  private:
+    struct Api;
+    struct Node;
     struct Context;
     std::unique_ptr<Context> context_;
 };
