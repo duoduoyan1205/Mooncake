@@ -1,0 +1,82 @@
+name: apply-mp-controlplane-step1
+
+on:
+  push:
+    branches: [mooncakempu-clean]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message, 'feat(store): route offload completion to memory pool')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mooncakempu-clean
+          fetch-depth: 1
+      - name: Apply step 1
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'{path}: expected 1 match, got {n}: {old[:120]!r}')
+              p.write_text(s.replace(old, new, 1))
+
+          # 1) Carry the backend identity and Memory Pool node id through the
+          # existing StorageObjectMetadata completion callback. This avoids a
+          # parallel offload-completion RPC while preserving compatibility with
+          # the current callback signature.
+          replace_once(
+              'mooncake-store/include/types.h',
+              'enum class BufferAllocatorType {',
+              'enum class StorageObjectBackendType : uint8_t {\n    kDefault = 0,\n    kMemoryPool = 1,\n};\n\nenum class BufferAllocatorType {')
+          replace_once(
+              'mooncake-store/include/types.h',
+              'struct StorageObjectMetadata {\n    int64_t bucket_id;\n    int64_t offset;\n    int64_t key_size;\n    int64_t data_size;\n    std::string transport_endpoint;\n    YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,\n             transport_endpoint);\n};',
+              'struct StorageObjectMetadata {\n    int64_t bucket_id;\n    int64_t offset;\n    int64_t key_size;\n    int64_t data_size;\n    std::string transport_endpoint;\n    StorageObjectBackendType backend_type = StorageObjectBackendType::kDefault;\n    std::string node_id;\n    YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,\n             transport_endpoint, backend_type, node_id);\n};')
+
+          # 2) Memory Pool backend marks completion metadata explicitly.\n          replace_once(
+              'mooncake-store/src/memory_pool_storage_backend.cpp',
+              '            static_cast<int64_t>(total), endpoint});',
+              '            static_cast<int64_t>(total), endpoint,\n            StorageObjectBackendType::kMemoryPool, node_id});')
+          replace_once(
+              'mooncake-store/src/memory_pool_storage_backend.cpp',
+              '                static_cast<int64_t>(entry.allocation.size), endpoint});',
+              '                static_cast<int64_t>(entry.allocation.size), endpoint,\n                StorageObjectBackendType::kMemoryPool,\n                EnvString("MOONCAKE_MEMORY_POOL_NODE_ID")});')
+
+          # 3) AddReplica becomes a first-class MEMORY_POOL replica registration
+          # path while retaining LOCAL_DISK behavior unchanged.
+          p = Path('mooncake-store/src/master_service.cpp')
+          s = p.read_text()
+          old = '''    if (!accessor.Exists()) {\n        accessor.Create(\n            client_id,\n            replica.get_descriptor().get_local_disk_descriptor().object_size,\n            std::vector<Replica>{}, false);\n    }\n    auto& metadata = accessor.Get();\n    if (replica.type() != ReplicaType::LOCAL_DISK) {\n        LOG(ERROR) << "Invalid replica type: " << replica.type()\n                   << ". Expected ReplicaType::LOCAL_DISK.";\n        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);\n    }\n\n    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {'''
+          new = '''    if (!accessor.Exists()) {\n        uint64_t object_size = 0;\n        if (replica.is_memory_pool_replica()) {\n            object_size =\n                replica.get_descriptor().get_memory_pool_descriptor().object_size;\n        } else if (replica.is_local_disk_replica()) {\n            object_size =\n                replica.get_descriptor().get_local_disk_descriptor().object_size;\n        } else {\n            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);\n        }\n        accessor.Create(client_id, object_size, std::vector<Replica>{}, false);\n    }\n    auto& metadata = accessor.Get();\n    if (replica.type() == ReplicaType::MEMORY_POOL) {\n        if (!metadata.HasReplica(&Replica::fn_is_memory_pool_replica)) {\n            std::vector<Replica> replicas;\n            replicas.emplace_back(std::move(replica));\n            metadata.AddReplicas(std::move(replicas));\n            SyncCacheTotalAccounting(metadata);\n            return true;\n        }\n        metadata.VisitReplicas(\n            [client_id](const Replica& rep) {\n                if (!rep.is_memory_pool_replica()) return false;\n                const auto& desc = rep.get_descriptor().get_memory_pool_descriptor();\n                return desc.node_id == std::to_string(client_id.first) + ":" +\n                       std::to_string(client_id.second);\n            },\n            [&replica](Replica& rep) {\n                auto& dst = rep.get_descriptor().get_memory_pool_descriptor();\n                const auto& src = replica.get_descriptor().get_memory_pool_descriptor();\n                dst.allocation_handle = src.allocation_handle;\n                dst.global_address = src.global_address;\n                dst.object_size = src.object_size;\n                dst.node_id = src.node_id;\n                dst.transport_endpoint = src.transport_endpoint;\n            });\n        return false;\n    }\n    if (replica.type() != ReplicaType::LOCAL_DISK) {\n        LOG(ERROR) << "Invalid replica type: " << replica.type()\n                   << ". Expected ReplicaType::LOCAL_DISK or MEMORY_POOL.";\n        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);\n    }\n\n    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {'''
+          if s.count(old) != 1:
+              raise SystemExit('AddReplica anchor not found exactly once')
+          p.write_text(s.replace(old, new, 1))
+
+          # 4) NotifyOffloadSuccess creates the appropriate replica type from
+          # the completion metadata, then reuses AddReplica for Memory Pool.
+          old = '''        Replica replica(client_id, metadata.data_size,\n                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);\n        bool handled_existing_object = false;'''
+          new = '''        const bool is_memory_pool =\n            metadata.backend_type == StorageObjectBackendType::kMemoryPool;\n        Replica replica = is_memory_pool\n                              ? Replica(static_cast<uint64_t>(metadata.bucket_id),\n                                        static_cast<uint64_t>(metadata.offset),\n                                        static_cast<uint64_t>(metadata.data_size),\n                                        metadata.node_id,\n                                        metadata.transport_endpoint,\n                                        ReplicaStatus::COMPLETE)\n                              : Replica(client_id, metadata.data_size,\n                                        metadata.transport_endpoint,\n                                        ReplicaStatus::COMPLETE);\n        if (is_memory_pool) {\n            auto normalized_tenant_result =\n                ResolveTenantIdForWrite(request_object_id.tenant_id);\n            if (!normalized_tenant_result) {\n                return tl::make_unexpected(normalized_tenant_result.error());\n            }\n            auto result = AddReplica(client_id, request_object_id.user_key,\n                                     normalized_tenant_result.value(), replica);\n            if (!result) {\n                return tl::make_unexpected(result.error());\n            }\n            continue;\n        }\n        bool handled_existing_object = false;'''
+          if s.count(old) != 1:
+              raise SystemExit('NotifyOffloadSuccess anchor not found exactly once')
+          p.write_text(s.replace(old, new, 1))
+
+          # Remove the temporary workflow after the source changes have been
+          # applied; this keeps the branch clean and prevents recursive runs.
+          Path('.github/workflows/apply-mp-controlplane-step1.yml').unlink()
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mooncake-store .github/workflows/apply-mp-controlplane-step1.yml
+          git diff --cached --check
+          git commit -m "feat(store): route offload completion to memory pool"
+          git push origin mooncakempu-clean
