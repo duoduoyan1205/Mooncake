@@ -10,6 +10,14 @@
 
 namespace mooncake {
 
+// The four MPU data paths exposed by the Memory Pool Node driver.
+enum class MemoryPoolAccessPath : uint32_t {
+    kPToD = amdgpu_mpu::kPathPToD,
+    kDToP = amdgpu_mpu::kPathDToP,
+    kDToPool = amdgpu_mpu::kPathDToPoolWrite,
+    kPoolToD = amdgpu_mpu::kPathDToPoolRead,
+};
+
 class MemoryPoolStorageBackend final : public StorageBackendInterface {
  public:
     explicit MemoryPoolStorageBackend(const FileStorageConfig& config);
@@ -33,6 +41,22 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    // Direct GPU-to-GPU paths. These are used by the P/D data path and do not
+    // create a Memory Pool allocation.
+    tl::expected<void, ErrorCode> TransferPToD(const Slice& src, const Slice& dst);
+    tl::expected<void, ErrorCode> TransferDToP(const Slice& src, const Slice& dst);
+
+    // Explicit Memory Pool paths. BatchOffload/BatchLoad are the normal
+    // StorageBackendInterface entry points and use these internally.
+    tl::expected<void, ErrorCode> TransferDToPool(const Slice& src,
+                                                   uint64_t allocation_handle,
+                                                   uint64_t global_address,
+                                                   uint64_t offset = 0);
+    tl::expected<void, ErrorCode> TransferPoolToD(const Slice& dst,
+                                                   uint64_t allocation_handle,
+                                                   uint64_t global_address,
+                                                   uint64_t offset = 0);
+
  private:
     struct Allocation { uint64_t handle = 0; uint64_t global_addr = 0; uint64_t size = 0; };
     struct Entry { Allocation allocation; uint64_t sequence = 0; };
@@ -43,6 +67,8 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
     tl::expected<void, ErrorCode> Free(const Allocation& allocation);
     tl::expected<void, ErrorCode> Transfer(const Slice& slice, const Allocation& allocation,
                                            uint64_t offset, bool to_pool);
+    tl::expected<void, ErrorCode> TransferGpuToGpu(const Slice& src, const Slice& dst,
+                                                   uint32_t path);
     tl::expected<void*, ErrorCode> MapAllocation(const Allocation& allocation);
     void UnmapAllocation(void* address, uint64_t size);
     bool LooksLikeDevicePointer(const void* ptr) const;
