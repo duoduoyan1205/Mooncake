@@ -14,6 +14,8 @@ set(MOONCAKE_STORE_SOURCES
     mmap_arena.cpp
     master_metric_manager.cpp
     storage_backend.cpp
+    memory_pool_storage_backend.cpp
+    memory_pool_storage_backend_factory.cpp
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
     nvme_kv_executor_io_uring.cpp
@@ -96,12 +98,17 @@ endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
+# Rename the mature factory in storage_backend.cpp so the Memory Pool backend
+# can provide the public factory without changing the large legacy switch.
+set_source_files_properties(
+  storage_backend.cpp
+  PROPERTIES COMPILE_DEFINITIONS "CreateStorageBackend=CreateStorageBackendLegacy")
+
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
 if(AWSSDK_FOUND)
   message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
   set(HAVE_AWS_SDK TRUE)
-  # Add S3 related source files
   list(APPEND MOONCAKE_STORE_SOURCES utils/s3_helper.cpp)
 else()
   message(STATUS "AWS SDK not found, S3 functionality will be disabled")
@@ -116,7 +123,6 @@ endif()
 
 set(EXTRA_LIBS ${ZSTD_LIBRARY})
 
-# If AWS SDK is found, add it to EXTRA_LIBS
 if(HAVE_AWS_SDK)
   list(APPEND EXTRA_LIBS ${AWSSDK_LINK_LIBRARIES})
   add_definitions(-DHAVE_AWS_SDK)
@@ -126,7 +132,6 @@ if(HAVE_AWS_SDK)
   endif()
 endif()
 
-# Find xxHash (required for ComputeChecksum)
 find_path(
   XXHASH_INCLUDE_DIR
   NAMES xxhash.h
@@ -185,7 +190,6 @@ if(USE_3FS)
   list(APPEND EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
-# io_uring support (auto-detected)
 find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
                                    /usr/local/lib64)
 find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
@@ -245,18 +249,10 @@ if(USE_NOF)
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_WRAPPER_SOURCES})
 
-  set(SPDK_INCLUDE_DIR
-      "/usr/local/include"
-      CACHE PATH "SPDK include directory")
-  set(DPDK_INCLUDE_DIR
-      "/usr/local/include"
-      CACHE PATH "DPDK include directory")
-  set(SPDK_LIB_DIR
-      "/usr/local/lib"
-      CACHE PATH "SPDK static library directory")
-  set(DPDK_LIB_DIR
-      "/usr/local/lib"
-      CACHE PATH "DPDK static library directory")
+  set(SPDK_INCLUDE_DIR "/usr/local/include" CACHE PATH "SPDK include directory")
+  set(DPDK_INCLUDE_DIR "/usr/local/include" CACHE PATH "DPDK include directory")
+  set(SPDK_LIB_DIR "/usr/local/lib" CACHE PATH "SPDK static library directory")
+  set(DPDK_LIB_DIR "/usr/local/lib" CACHE PATH "DPDK static library directory")
 
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
@@ -301,50 +297,28 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_cryptodev.a
       ${DPDK_LIB_DIR}/librte_hash.a
       ${DPDK_LIB_DIR}/librte_rcu.a
-      pthread
-      dl
-      numa
-      rt
-      m
-      uuid
-      crypto
-      aio
-      z
-      isal
-      elf
-      ibverbs
-      rdmacm
-      ssl
-      bsd)
+      pthread dl numa rt m uuid crypto aio z isal elf ibverbs rdmacm ssl bsd)
 endif()
 
-# The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 if(BUILD_UNIT_TESTS)
-  target_compile_definitions(mooncake_store
-                             PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+  target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
 endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 endif()
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
-  target_compile_definitions(mooncake_store
-                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)
-  target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
-                                                    ${DPDK_INCLUDE_DIR})
+  target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
 endif()
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 if(STORE_USE_REDIS)
-  target_include_directories(mooncake_store
-                             PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+  target_include_directories(mooncake_store PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
 endif()
-# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g.,
-# vendor-specific hardware) to targets that don't need it (e.g.,
-# mooncake_master). Targets that need transfer_engine should link it explicitly.
 target_link_libraries(
   mooncake_store
   PUBLIC cachelib_memory_allocator
@@ -356,7 +330,6 @@ target_link_libraries(
          mooncake_common
          yaml-cpp
          asio_shared
-         mooncake_common
          yalantinglibs::yalantinglibs
   PRIVATE transfer_engine JsonCpp::JsonCpp)
 if(STORE_USE_ETCD)
@@ -378,22 +351,17 @@ if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
 
-# Master binary
 include(CheckPIESupported)
 check_pie_supported(LANGUAGES CXX)
-
 add_executable(mooncake_master master.cpp)
-
 set(MASTER_EXTRA_INCS)
 set(MASTER_EXTRA_LIBS)
-
 if(STORE_USE_JEMALLOC)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(JEMALLOC REQUIRED jemalloc)
   list(APPEND MASTER_EXTRA_INCS ${JEMALLOC_INCLUDE_DIRS})
   list(APPEND MASTER_EXTRA_LIBS ${JEMALLOC_STATIC_LIBRARIES})
 endif()
-
 target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
 target_link_libraries(
   mooncake_master
@@ -406,27 +374,17 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
-# mooncake_store is static and propagates optional runtime dependencies to its
-# consumers. The metadata-only master does not use accelerator staging, so drop
-# those dependencies when they do not satisfy any symbols in the final binary.
 target_link_options(mooncake_master PRIVATE "LINKER:--as-needed")
 if(USE_SUNRISE)
   target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
 endif()
-
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
 
-# Client server binary
 add_executable(mooncake_client real_client_main.cpp)
-# Client needs transfer_engine for data transfer operations
-target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
-                                              asio_shared)
-set_target_properties(mooncake_master mooncake_client
-                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# Optimize binary sizes only in Release mode
+target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine asio_shared)
+set_target_properties(mooncake_master mooncake_client PROPERTIES POSITION_INDEPENDENT_CODE ON)
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
   target_compile_options(mooncake_master PRIVATE -Os)
@@ -435,29 +393,13 @@ if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
   target_link_options(mooncake_client PRIVATE -Os -s)
 endif()
 
-# GPU runtime library for D2H staging in PutToLocalFile / OffloadObjects.
-# transfer_engine is PRIVATE-linked, so its CUDA/HIP/Ascend dependencies are not
-# propagated; we must detect and link them independently.
-#
-# Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags, because
-# USE_CUDA may be OFF even when GPU pointers are present (e.g.
-# WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart). Each
-# detected toolkit gets both link libraries AND compile definitions, so that
-# AcceleratorDevice implementations and pinned_buffer_pool.h pick the correct
-# backend.
-#
-# NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
-# Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
-# Go's build.sh already does this; CI workflows must do the same.
-
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
   message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
   target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
   target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
   target_include_directories(mooncake_store PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-  target_include_directories(mooncake_client
-                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_include_directories(mooncake_client PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
   target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
 endif()
@@ -473,9 +415,7 @@ if(NOT CUDAToolkit_FOUND)
   endif()
 endif()
 
-if(USE_ASCEND
-   OR USE_ASCEND_DIRECT
-   OR USE_UBSHMEM)
+if(USE_ASCEND OR USE_ASCEND_DIRECT OR USE_UBSHMEM)
   target_include_directories(mooncake_store PRIVATE $ENV{ASCEND_PATH}/include)
   target_link_libraries(mooncake_store PRIVATE ascendcl)
   target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
@@ -483,69 +423,33 @@ if(USE_ASCEND
 endif()
 
 if(USE_SUNRISE)
-  target_link_libraries(
-    mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
-  target_link_libraries(
-    mooncake_client PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(mooncake_client PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
 endif()
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
 
-# ---------------------------------------------------------------------------
-# Optional: a self-contained libmooncake_store.so exporting only the store_c.h
-# C ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
-# feature). Whole-archives the static mooncake_store + asio_static (objects are
-# -fPIC, see mooncake-common/common.cmake) and localizes everything else via the
-# version script; only system/toolkit libs (and the Go etcd/k8s backends when
-# enabled) stay DT_NEEDED.
-# ---------------------------------------------------------------------------
 if(WITH_STORE_C_SHARED)
-  # ELF/GNU-ld features (--whole-archive, --as-needed, version script, $ORIGIN);
-  # supported by GNU ld, gold, and lld. Linux only.
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(
-      FATAL_ERROR
-        "WITH_STORE_C_SHARED currently supports Linux/ELF only "
-        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
+    message(FATAL_ERROR "WITH_STORE_C_SHARED currently supports Linux/ELF only (got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
   endif()
-
-  # We whole-archive mooncake_store and reuse its name, so require it to be static
-  # (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some backends
-  # force ON).
   get_target_property(_mooncake_store_type mooncake_store TYPE)
   if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
-    message(
-      FATAL_ERROR
-        "WITH_STORE_C_SHARED requires mooncake_store to be a STATIC_LIBRARY "
-        "(got ${_mooncake_store_type}); configure with BUILD_SHARED_LIBS=OFF.")
+    message(FATAL_ERROR "WITH_STORE_C_SHARED requires mooncake_store to be a STATIC_LIBRARY (got ${_mooncake_store_type}); configure with BUILD_SHARED_LIBS=OFF.")
   endif()
-
   add_library(mooncake_store_c SHARED store_c_shared.cpp)
   set_target_properties(
     mooncake_store_c
     PROPERTIES OUTPUT_NAME mooncake_store
-               # Separate dir so this .so does not shadow the static
-               # libmooncake_store.a on the Rust `link` backend's -L path.
                LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/shared"
-               # $ORIGIN so the installed .so finds co-installed deps (CMake
-               # strips the build RUNPATH on install).
                INSTALL_RPATH "$ORIGIN"
-               # Relink when the version script (a bare link flag) changes.
                LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/store_c.map")
   add_dependencies(mooncake_store_c mooncake_store asio_static)
-  # Whole-archive the static lib + asio_static via file paths (no interface-dep
-  # propagation); re-list the mooncake_store target for its transitive deps.
-  # --as-needed drops the now-redundant transitive libasio.so.
   target_link_libraries(
     mooncake_store_c
     PRIVATE -Wl,--whole-archive "$<TARGET_FILE:mooncake_store>"
             "$<TARGET_FILE:asio_static>" -Wl,--no-whole-archive -Wl,--as-needed
             mooncake_store)
-  # Export only the C ABI; the version script localizes every other symbol
-  # pulled from the static archives. Strip debug info in Release (it dominates
-  # the .so size).
   target_link_options(
     mooncake_store_c PRIVATE
     "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/store_c.map"
