@@ -2,84 +2,12 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <dlfcn.h>
-#include <mutex>
 #include <string>
-#include <unordered_map>
 
 #include "device/accelerator_registry.h"
 
 namespace mooncake {
 namespace {
-constexpr uint64_t kAlignment = 4096;
-constexpr uint64_t kTimeoutNs = 30ULL * 1000 * 1000 * 1000;
-
-// ABI-compatible subset of the userspace MPU/SUE verbs library.  The
-// Memory Pool backend deliberately loads this C ABI at runtime so Mooncake
-// does not need to link to a vendor-specific library at build time.
-struct amdgpu_mpu_ctx;
-struct amdgpu_mpu_buf {
-    uint64_t handle;
-    uint64_t global_addr;
-    uint64_t size;
-    void* cpu_addr;
-    size_t mapped_len;
-};
-struct amdgpu_mpu_caps {
-    uint32_t sue_version;
-    uint32_t sue_caps;
-    uint32_t num_queues;
-    uint32_t flags;
-    uint64_t mem_base;
-    uint64_t mem_size;
-};
-
-enum amdgpu_mpu_path {
-    kPToD = 0,
-    kDToP = 1,
-    kDToPoolWrite = 2,
-    kDToPoolRead = 3,
-};
-
-using FnOpen = int (*)(const char*, amdgpu_mpu_ctx**);
-using FnClose = void (*)(amdgpu_mpu_ctx*);
-using FnGetCaps = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_caps*);
-using FnAlloc = int (*)(amdgpu_mpu_ctx*, size_t, size_t, amdgpu_mpu_buf*);
-using FnFree = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_buf*);
-using FnSubmitAndWait = int (*)(amdgpu_mpu_ctx*, amdgpu_mpu_path, uint64_t,
-                                uint64_t, size_t, uint32_t, uint64_t, int*);
-
-struct SueVerbsApi {
-    FnOpen open = nullptr;
-    FnClose close = nullptr;
-    FnGetCaps get_caps = nullptr;
-    FnAlloc alloc = nullptr;
-    FnFree free = nullptr;
-    FnSubmitAndWait submit_and_wait = nullptr;
-};
-
-std::mutex& ApiMutex() {
-    static std::mutex mutex;
-    return mutex;
-}
-
-std::unordered_map<void*, SueVerbsApi>& ApiMap() {
-    static std::unordered_map<void*, SueVerbsApi> map;
-    return map;
-}
-
-bool GetApi(void* ctx, SueVerbsApi* api) {
-    std::lock_guard<std::mutex> lock(ApiMutex());
-    auto it = ApiMap().find(ctx);
-    if (it == ApiMap().end()) return false;
-    *api = it->second;
-    return true;
-}
-
-uint64_t AlignUp(uint64_t v) {
-    return (v + kAlignment - 1) & ~(kAlignment - 1);
-}
-
 std::string DevicePath() {
     const char* p = std::getenv("MOONCAKE_MEMORY_POOL_DEVICE");
     return p && *p ? p : "/dev/amdgpu-mpu";
@@ -94,205 +22,97 @@ std::string EnvString(const char* name) {
     const char* value = std::getenv(name);
     return value ? std::string(value) : std::string();
 }
-
-template <typename T>
-bool LoadSymbol(void* handle, const char* name, T* out) {
-    dlerror();
-    void* symbol = dlsym(handle, name);
-    const char* error = dlerror();
-    if (error || !symbol) return false;
-    *out = reinterpret_cast<T>(symbol);
-    return true;
-}
 }  // namespace
 
 MemoryPoolStorageBackend::MemoryPoolStorageBackend(
     const FileStorageConfig& config)
     : StorageBackendInterface(config),
-      sueverbs_library_(SueVerbsLibrary()),
-      device_path_(DevicePath()),
+      transfer_engine_(std::make_unique<MemoryPoolTransferEngine>(
+          SueVerbsLibrary(), DevicePath())),
       capacity_(static_cast<uint64_t>(
           std::max<int64_t>(0, config.total_size_limit))) {}
 
-MemoryPoolStorageBackend::~MemoryPoolStorageBackend() {
-    RemoveAll();
-    CloseDevice();
-}
-
-tl::expected<void, ErrorCode> MemoryPoolStorageBackend::OpenDevice() {
-    if (sueverbs_ctx_) return {};
-
-    sueverbs_handle_ = dlopen(sueverbs_library_.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!sueverbs_handle_) {
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-
-    SueVerbsApi api;
-    const bool loaded =
-        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_open", &api.open) &&
-        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_close", &api.close) &&
-        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_get_caps", &api.get_caps) &&
-        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_alloc", &api.alloc) &&
-        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_free", &api.free) &&
-        LoadSymbol(sueverbs_handle_, "amdgpu_mpu_submit_and_wait",
-                   &api.submit_and_wait);
-    if (!loaded) {
-        dlclose(sueverbs_handle_);
-        sueverbs_handle_ = nullptr;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-
-    amdgpu_mpu_ctx* ctx = nullptr;
-    if (api.open(device_path_.c_str(), &ctx) != 0 || !ctx) {
-        dlclose(sueverbs_handle_);
-        sueverbs_handle_ = nullptr;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-
-    amdgpu_mpu_caps caps{};
-    if (api.get_caps(ctx, &caps) != 0 || !caps.mem_size) {
-        api.close(ctx);
-        dlclose(sueverbs_handle_);
-        sueverbs_handle_ = nullptr;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    capacity_ = capacity_ ? std::min(capacity_, caps.mem_size) : caps.mem_size;
-    if (!capacity_) {
-        api.close(ctx);
-        dlclose(sueverbs_handle_);
-        sueverbs_handle_ = nullptr;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(ApiMutex());
-        ApiMap()[ctx] = api;
-    }
-    sueverbs_ctx_ = ctx;
-    return {};
-}
-
-void MemoryPoolStorageBackend::CloseDevice() {
-    if (!sueverbs_handle_) return;
-
-    SueVerbsApi api;
-    if (sueverbs_ctx_ && GetApi(sueverbs_ctx_, &api)) {
-        api.close(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_));
-        std::lock_guard<std::mutex> lock(ApiMutex());
-        ApiMap().erase(sueverbs_ctx_);
-    }
-    sueverbs_ctx_ = nullptr;
-    dlclose(sueverbs_handle_);
-    sueverbs_handle_ = nullptr;
-}
+MemoryPoolStorageBackend::~MemoryPoolStorageBackend() { RemoveAll(); }
 
 tl::expected<MemoryPoolStorageBackend::Allocation, ErrorCode>
 MemoryPoolStorageBackend::Allocate(uint64_t size) {
-    if (!sueverbs_ctx_) {
+    if (!transfer_engine_ || !transfer_engine_->IsOpen()) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    SueVerbsApi api;
-    if (!GetApi(sueverbs_ctx_, &api)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    amdgpu_mpu_buf buf{};
-    if (api.alloc(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_), AlignUp(size),
-                  kAlignment, &buf) != 0) {
+    Allocation allocation;
+    if (transfer_engine_->Allocate(size, &allocation) != 0) {
         return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
-    return Allocation{buf.handle, buf.global_addr, buf.size};
+    return allocation;
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Free(
     const Allocation& allocation) {
-    if (!allocation.handle || !sueverbs_ctx_) return {};
-    SueVerbsApi api;
-    if (!GetApi(sueverbs_ctx_, &api)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    amdgpu_mpu_buf buf{};
-    buf.handle = allocation.handle;
-    buf.global_addr = allocation.global_addr;
-    buf.size = allocation.size;
-    if (api.free(static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_), &buf) != 0) {
+    if (!transfer_engine_) return {};
+    if (transfer_engine_->Free(allocation) != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
 }
 
 bool MemoryPoolStorageBackend::LooksLikeDevicePointer(const void* ptr) const {
-    if (!ptr) return false;
-    auto& registry = device::GetAcceleratorRegistry().RuntimeAccelerators();
-    device::PointerInfo info{};
-    return registry.FindDeviceForPointer(const_cast<void*>(ptr), &info) != nullptr;
+    return transfer_engine_ && transfer_engine_->LooksLikeDevicePointer(ptr);
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferGpuToGpu(
-    const Slice& src, const Slice& dst, uint32_t path) {
-    if (!sueverbs_ctx_ || !LooksLikeDevicePointer(src.ptr) ||
-        !LooksLikeDevicePointer(dst.ptr) || !src.size || !dst.size ||
-        src.size != dst.size) {
+    const Slice& src, const Slice& dst, MemoryPoolAccessPath path) {
+    if (!transfer_engine_ || !transfer_engine_->IsOpen() ||
+        !LooksLikeDevicePointer(src.ptr) || !LooksLikeDevicePointer(dst.ptr) ||
+        !src.size || !dst.size || src.size != dst.size) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    SueVerbsApi api;
-    if (!GetApi(sueverbs_ctx_, &api)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    int rc = -1;
+    switch (path) {
+        case MemoryPoolAccessPath::kPToD:
+            rc = transfer_engine_->TransferPToD(
+                reinterpret_cast<uint64_t>(src.ptr),
+                reinterpret_cast<uint64_t>(dst.ptr), src.size);
+            break;
+        case MemoryPoolAccessPath::kDToP:
+            rc = transfer_engine_->TransferDToP(
+                reinterpret_cast<uint64_t>(src.ptr),
+                reinterpret_cast<uint64_t>(dst.ptr), src.size);
+            break;
+        default:
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-
-    int status = 0;
-    const uint32_t flags = amdgpu_mpu::kXferSignal | amdgpu_mpu::kXferOrdered;
-    const int rc = api.submit_and_wait(
-        static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_),
-        static_cast<amdgpu_mpu_path>(path), reinterpret_cast<uint64_t>(src.ptr),
-        reinterpret_cast<uint64_t>(dst.ptr), src.size, flags, kTimeoutNs,
-        &status);
-    if (rc != 0 || status != 0) {
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
+    if (rc != 0) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     return {};
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferPToD(
     const Slice& src, const Slice& dst) {
-    return TransferGpuToGpu(src, dst, amdgpu_mpu::kPathPToD);
+    return TransferGpuToGpu(src, dst, MemoryPoolAccessPath::kPToD);
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferDToP(
     const Slice& src, const Slice& dst) {
-    return TransferGpuToGpu(src, dst, amdgpu_mpu::kPathDToP);
+    return TransferGpuToGpu(src, dst, MemoryPoolAccessPath::kDToP);
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Transfer(
     const Slice& slice, const Allocation& allocation, uint64_t offset,
     bool to_pool) {
-    if (!sueverbs_ctx_ || !LooksLikeDevicePointer(slice.ptr) || !slice.size ||
+    if (!transfer_engine_ || !transfer_engine_->IsOpen() ||
+        !LooksLikeDevicePointer(slice.ptr) || !slice.size ||
         offset > allocation.size || slice.size > allocation.size - offset) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    SueVerbsApi api;
-    if (!GetApi(sueverbs_ctx_, &api)) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
     const uint64_t pool_addr = allocation.global_addr + offset;
-    const uint32_t flags = amdgpu_mpu::kXferSignal | amdgpu_mpu::kXferOrdered;
-    const uint64_t src_addr = to_pool ? reinterpret_cast<uint64_t>(slice.ptr)
-                                      : pool_addr;
-    const uint64_t dst_addr = to_pool ? pool_addr
-                                      : reinterpret_cast<uint64_t>(slice.ptr);
-    const uint32_t path = to_pool ? kDToPoolWrite : kDToPoolRead;
-
-    int status = 0;
-    const int rc = api.submit_and_wait(
-        static_cast<amdgpu_mpu_ctx*>(sueverbs_ctx_),
-        static_cast<amdgpu_mpu_path>(path), src_addr, dst_addr, slice.size,
-        flags, kTimeoutNs, &status);
-    if (rc != 0 || status != 0) {
+    const uint64_t gpu_addr = reinterpret_cast<uint64_t>(slice.ptr);
+    const int rc = to_pool
+                       ? transfer_engine_->TransferDToPool(
+                             gpu_addr, pool_addr, slice.size)
+                       : transfer_engine_->TransferPoolToD(
+                             pool_addr, gpu_addr, slice.size);
+    if (rc != 0) {
         return tl::make_unexpected(to_pool ? ErrorCode::FILE_WRITE_FAIL
                                            : ErrorCode::FILE_READ_FAIL);
     }
@@ -398,9 +218,25 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::EvictForSpace(
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::Init() {
     bool expected = false;
     if (!initialized_.compare_exchange_strong(expected, true)) return {};
-    auto result = OpenDevice();
-    if (!result) initialized_.store(false, std::memory_order_release);
-    return result;
+    if (!transfer_engine_) {
+        initialized_.store(false, std::memory_order_release);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    const int rc = transfer_engine_->Open();
+    if (rc != 0) {
+        initialized_.store(false, std::memory_order_release);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+
+    capacity_ = capacity_ ? std::min(capacity_, transfer_engine_->Capacity())
+                          : transfer_engine_->Capacity();
+    if (!capacity_) {
+        transfer_engine_->Close();
+        initialized_.store(false, std::memory_order_release);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return {};
 }
 
 tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
@@ -547,6 +383,8 @@ void MemoryPoolStorageBackend::RemoveAll() {
     for (const auto& allocation : local_allocations) {
         (void)Free(allocation);
     }
+    if (transfer_engine_) transfer_engine_->Close();
+    initialized_.store(false, std::memory_order_release);
 }
 
 tl::expected<std::vector<std::string>, ErrorCode>
