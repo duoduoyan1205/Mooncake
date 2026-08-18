@@ -53,6 +53,7 @@ target_link_libraries(
          glog::glog
          gflags::gflags
          pthread
+         dl
          JsonCpp::JsonCpp
          numa
          asio_shared
