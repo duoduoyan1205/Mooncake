@@ -9,9 +9,6 @@ set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 # ---------------------------------------------------------------------------
 # AMDGPU-MPU ABI 1.8
 # ---------------------------------------------------------------------------
-# memory_pool_transfer_engine.cpp consumes the public userspace ABI directly.
-# Make the dependency explicit: do not silently compile the source with a
-# missing/old header and do not rely on an incidental include path.
 set(AMDGPU_MPU_ROOT "" CACHE PATH
     "AMDGPU-MPU installation/prefix containing include/ and lib/")
 set(AMDGPU_MPU_INCLUDE_DIR "" CACHE PATH
@@ -55,10 +52,16 @@ if(NOT AMDGPU_MPU_LIBRARY OR NOT EXISTS "${AMDGPU_MPU_LIBRARY}")
     "Set AMDGPU_MPU_ROOT or AMDGPU_MPU_LIBRARY.")
 endif()
 
-# Keep this as a target-scoped dependency rather than a global include path.
-# The library is loaded through dlopen/dlsym by the MPU adapter, but linking
-# it explicitly here documents and validates the ABI dependency at configure
-# time and makes the runtime search path deterministic.
+if(USE_HIP)
+  hipify_files(ENGINE_SOURCES)
+endif()
+
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+
+# The MPU adapter consumes the public ABI header and shared library. Keep the
+# dependency target-scoped and explicit; the adapter may still use dlopen/dlsym
+# internally for symbol resolution, but configuration/build must validate that
+# the ABI 1.8 installation is present.
 target_include_directories(transfer_engine PRIVATE "${AMDGPU_MPU_INCLUDE_DIR}")
 target_link_libraries(transfer_engine PRIVATE "${AMDGPU_MPU_LIBRARY}")
 get_filename_component(AMDGPU_MPU_LIBRARY_DIR
@@ -68,11 +71,6 @@ set_property(TARGET transfer_engine APPEND PROPERTY
 set_property(TARGET transfer_engine APPEND PROPERTY
   INSTALL_RPATH "${AMDGPU_MPU_LIBRARY_DIR}")
 
-if(USE_HIP)
-  hipify_files(ENGINE_SOURCES)
-endif()
-
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
