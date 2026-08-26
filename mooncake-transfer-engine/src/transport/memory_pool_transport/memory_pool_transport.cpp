@@ -89,6 +89,27 @@ int MemoryPoolTransport::unregisterLocalMemoryBatch(
     return first_error;
 }
 
+int MemoryPoolTransport::importGpuDmaBuf(
+    int dmabuf_fd, uint64_t device_addr, uint64_t length,
+    ImportedDmaBuf* imported) {
+    if (!engine_) return -ENODEV;
+    return engine_->ImportDmaBuf(dmabuf_fd, device_addr, length,
+                                 DmaBufType::GPU, imported);
+}
+
+int MemoryPoolTransport::importNicDmaBuf(
+    int dmabuf_fd, uint64_t device_addr, uint64_t length,
+    ImportedDmaBuf* imported) {
+    if (!engine_) return -ENODEV;
+    return engine_->ImportDmaBuf(dmabuf_fd, device_addr, length,
+                                 DmaBufType::NIC, imported);
+}
+
+int MemoryPoolTransport::releaseDmaBuf(ImportedDmaBuf* imported) {
+    if (!engine_) return -ENODEV;
+    return engine_->ReleaseDmaBuf(imported);
+}
+
 Status MemoryPoolTransport::resolveTarget(const TransferRequest& request,
                                           uint64_t* target_addr,
                                           size_t* available) const {
@@ -168,23 +189,15 @@ Status MemoryPoolTransport::submitTask(TransferTask* task) {
     task->slice_list.push_back(slice);
     __sync_fetch_and_add(&task->slice_count, 1);
 
-    // ABI 1.8 currently exposes allocation/target-address/DMA-BUF/mmap,
-    // but no CPU-side transfer primitive. This is the host-visible baseline
-    // path. GPU/NIC DMA-BUF import will replace this memcpy path without
-    // changing the Transport/TransferRequest interface.
-    if (!request.source || !target_addr) {
-        slice->markFailed();
-        return Status::InvalidArgument("Invalid Memory Pool transfer address");
-    }
-
-    void* target = reinterpret_cast<void*>(target_addr);
-    if (request.opcode == TransferRequest::READ)
-        std::memcpy(request.source, target, request.length);
-    else
-        std::memcpy(target, request.source, request.length);
-
-    slice->markSuccess();
-    return Status::OK();
+    // The MPU ABI currently has allocation, target-address, DMA-BUF export and
+    // mmap operations, but no SUE data-plane submission/completion ioctl yet.
+    // Do not turn a CPU memcpy into a false positive for the Memory Pool data
+    // path. Once the MPU submission ABI is added, this is the only place that
+    // needs to translate TransferRequest into an MPU/SUE operation.
+    (void)request;
+    slice->markFailed();
+    return Status::NotSupportedTransport(
+        "Memory Pool data-plane submission requires MPU/SUE submission ABI");
 }
 
 Status MemoryPoolTransport::getTransferStatus(BatchID batch_id, size_t task_id,
