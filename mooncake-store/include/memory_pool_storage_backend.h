@@ -12,16 +12,13 @@
 
 namespace mooncake {
 
-// Mooncake Store backend for the SUE/AMDGPU Memory Pool Node.
+// Mooncake Store backend for the AMDGPU MPU Memory Pool Node.
 //
-// The backend treats the Memory Pool as a byte-addressable KV tier:
-//   logical key -> {MPU handle, global address, length}
-//
-// BatchOffload issues D->POOL transactions and BatchLoad issues
-// POOL->D transactions through /dev/amdgpu-mpu. The metadata is deliberately
-// kept local to this process in the first phase; the existing LOCAL_DISK
-// replica notification path is used until the master gets a dedicated
-// MEMORY_POOL replica type.
+// The current MPU DRM UAPI owns node-memory allocations through GEM/DRM and
+// returns both an MPU-local GPU VA and an initiator-visible target address.
+// Data movement is intentionally not faked in this backend: the old private
+// XFER ioctl was removed from the driver. A subsequent transport integration
+// will consume the target address through the GPU/NIC DMA-BUF/SUE path.
 class MemoryPoolStorageBackend final : public StorageBackendInterface {
    public:
     explicit MemoryPoolStorageBackend(const FileStorageConfig& config);
@@ -53,16 +50,15 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
-    // The first implementation intentionally keeps the existing LOCAL_DISK
-    // master/replica protocol. A later patch can switch this to a dedicated
-    // MEMORY_POOL replica without changing the local data path.
     bool IsMemoryPoolBackend() const { return true; }
 
    private:
     struct Allocation {
-        uint64_t handle = 0;
-        uint64_t global_addr = 0;
+        uint32_t handle = 0;
+        uint64_t target_addr = 0;
+        uint64_t gpu_addr = 0;
         uint64_t size = 0;
+        uint64_t mmap_offset = 0;
     };
 
     struct Entry {
@@ -81,19 +77,8 @@ class MemoryPoolStorageBackend final : public StorageBackendInterface {
     tl::expected<void, ErrorCode> TransferPoolToDevice(
         const Allocation& source, const Slice& destination, uint64_t offset);
 
-    // CPU-mapped fallback is useful for unit/integration bring-up when the
-    // caller passes a host Slice. The hot path for GPU pointers never uses it.
-    tl::expected<void*, ErrorCode> MapAllocation(const Allocation& allocation);
-    void UnmapAllocation(void* address, uint64_t size);
-
-    tl::expected<void, ErrorCode> TransferWithCpuMapping(
-        const Slice& source, const Allocation& allocation, bool to_pool,
-        uint64_t offset);
-
     tl::expected<void, ErrorCode> EvictForSpace(
         uint64_t required_size, EvictionHandler eviction_handler);
-
-    bool LooksLikeDevicePointer(const void* ptr) const;
 
     int fd_ = -1;
     std::string device_path_;

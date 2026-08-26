@@ -5,81 +5,81 @@
 
 namespace mooncake::amdgpu_mpu {
 
-// Keep this header in sync with duoduoyan1205/amdgpu-mpu's
-// kernel/amdgpu/amdgpu_mpu_ioctl.h.  It is intentionally self-contained so
-// Mooncake does not need the kernel source tree at build time.
+// Userspace mirror of kernel/drm/amdgpu_mpu/amdgpu_mpu_uapi.h.
+// Keep the layouts and ioctl numbers byte-for-byte compatible with the MPU
+// DRM UAPI. The MPU is a DRM render device; it no longer exposes the old
+// private ALLOC/FREE/XFER/WAIT ioctl family.
+constexpr uint32_t kUapiVersion = 5;
+constexpr unsigned long kDrmIoctlBase = 'd';
+constexpr unsigned long kDrmCommandBase = 0x40;
 
-constexpr unsigned long kIoctlBase = 'M';
-
-constexpr uint32_t kPathPToD = 0;
-constexpr uint32_t kPathDToP = 1;
-constexpr uint32_t kPathDToPoolWrite = 2;
-constexpr uint32_t kPathDToPoolRead = 3;
-
-constexpr uint32_t kXferSignal = 1U << 0;
-constexpr uint32_t kXferFence = 1U << 1;
-constexpr uint32_t kXferNonblock = 1U << 2;
-constexpr uint32_t kXferOrdered = 1U << 3;
-
-struct IoctlAlloc {
+struct GemCreate {
     uint64_t size;
     uint64_t alignment;
-    uint64_t handle;
-    uint64_t global_addr;
-};
-
-struct IoctlFree {
-    uint64_t handle;
-};
-
-struct IoctlXfer {
-    uint64_t src_addr;
-    uint64_t dst_addr;
-    uint64_t length;
-    uint32_t path;
+    uint32_t handle;
     uint32_t flags;
-    uint64_t cookie;
-    int32_t fence_fd;
-    uint32_t reserved;
-    uint64_t src_handle;
-    uint64_t dst_handle;
+    uint64_t gpu_addr;
+    uint64_t target_addr;
+    uint64_t mmap_offset;
 };
 
-struct IoctlWait {
-    uint64_t cookie;
-    uint64_t timeout_ns;
-    int32_t status;
-    uint32_t reserved;
-};
+constexpr uint32_t kGemCreateNodeMemory = 1U << 0;
 
-struct IoctlMmap {
-    uint64_t handle;
+struct GemMmap {
+    uint32_t handle;
+    uint32_t flags;
     uint64_t offset;
-    uint64_t size;
+};
+
+struct VmMap {
+    uint32_t handle;
     uint32_t flags;
+    uint64_t gpu_addr;
+};
+
+struct VmUnmap {
+    uint32_t handle;
     uint32_t reserved;
 };
 
-struct IoctlCaps {
-    uint32_t sue_version;
-    uint32_t sue_caps;
-    uint32_t num_queues;
+struct Caps {
+    uint32_t version;
     uint32_t flags;
+    uint32_t vmid;
+    uint32_t page_shift;
+    uint64_t va_start;
+    uint64_t va_end;
     uint64_t mem_base;
     uint64_t mem_size;
 };
 
-#define MOONCAKE_AMDGPU_MPU_IOCTL_ALLOC \
-    _IOWR(kIoctlBase, 0x00, mooncake::amdgpu_mpu::IoctlAlloc)
-#define MOONCAKE_AMDGPU_MPU_IOCTL_FREE \
-    _IOW(kIoctlBase, 0x01, mooncake::amdgpu_mpu::IoctlFree)
-#define MOONCAKE_AMDGPU_MPU_IOCTL_XFER \
-    _IOWR(kIoctlBase, 0x02, mooncake::amdgpu_mpu::IoctlXfer)
-#define MOONCAKE_AMDGPU_MPU_IOCTL_WAIT \
-    _IOWR(kIoctlBase, 0x03, mooncake::amdgpu_mpu::IoctlWait)
-#define MOONCAKE_AMDGPU_MPU_IOCTL_MMAP \
-    _IOWR(kIoctlBase, 0x05, mooncake::amdgpu_mpu::IoctlMmap)
-#define MOONCAKE_AMDGPU_MPU_IOCTL_CAPS \
-    _IOR(kIoctlBase, 0x06, mooncake::amdgpu_mpu::IoctlCaps)
+constexpr uint32_t kCapMmu = 1U << 0;
+constexpr uint32_t kCapGpuVm = 1U << 1;
+constexpr uint32_t kCapSue = 1U << 3;
+constexpr uint32_t kCapP2p = 1U << 4;
+
+#define MOONCAKE_AMDGPU_MPU_GEM_CREATE \
+    _IOWR(kDrmIoctlBase, kDrmCommandBase + 0x00, \
+          mooncake::amdgpu_mpu::GemCreate)
+#define MOONCAKE_AMDGPU_MPU_GEM_MMAP \
+    _IOWR(kDrmIoctlBase, kDrmCommandBase + 0x01, \
+          mooncake::amdgpu_mpu::GemMmap)
+#define MOONCAKE_AMDGPU_MPU_VM_MAP \
+    _IOWR(kDrmIoctlBase, kDrmCommandBase + 0x02, \
+          mooncake::amdgpu_mpu::VmMap)
+#define MOONCAKE_AMDGPU_MPU_VM_UNMAP \
+    _IOW(kDrmIoctlBase, kDrmCommandBase + 0x03, \
+         mooncake::amdgpu_mpu::VmUnmap)
+#define MOONCAKE_AMDGPU_MPU_GET_CAPS \
+    _IOR(kDrmIoctlBase, kDrmCommandBase + 0x04, \
+         mooncake::amdgpu_mpu::Caps)
+
+struct GemClose {
+    uint32_t handle;
+    uint32_t pad;
+};
+
+#define MOONCAKE_AMDGPU_MPU_GEM_CLOSE \
+    _IOW(kDrmIoctlBase, 0x09, mooncake::amdgpu_mpu::GemClose)
 
 }  // namespace mooncake::amdgpu_mpu
