@@ -266,11 +266,22 @@ int MemoryPoolTransferEngine::ExportDmaBuf(Allocation* allocation, int flags,
     if (allocation->node_id >= context_->nodes.size()) return -EINVAL;
     if (allocation->dmabuf_fd >= 0) return -EBUSY;
 
+    int exported_fd = -1;
     const int rc = context_->api->export_dmabuf(
         context_->nodes[allocation->node_id].ctx, &allocation->buf, flags,
-        dmabuf_fd);
+        &exported_fd);
     if (rc) return rc;
-    allocation->dmabuf_fd = *dmabuf_fd;
+
+    const int owned_fd = dup(exported_fd);
+    if (owned_fd < 0) {
+        const int saved_errno = errno;
+        close(exported_fd);
+        return -saved_errno;
+    }
+
+    // Caller owns exported_fd; Allocation owns an independent duplicate.
+    allocation->dmabuf_fd = owned_fd;
+    *dmabuf_fd = exported_fd;
     return 0;
 }
 
