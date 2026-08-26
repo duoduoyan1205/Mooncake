@@ -11,6 +11,20 @@ namespace mooncake {
 
 class MemoryPoolTransferEngine {
  public:
+    enum class DmaBufType : uint8_t {
+        GPU = 0,
+        NIC = 1,
+    };
+
+    struct ImportedDmaBuf {
+        int fd = -1;
+        uint64_t length = 0;
+        uint64_t address = 0;
+        DmaBufType type = DmaBufType::GPU;
+
+        bool valid() const { return fd >= 0 && length != 0; }
+    };
+
     // Allocation is owned by its MemoryPoolTransferEngine. It must be
     // released before the engine is closed or destroyed.
     struct Allocation {
@@ -51,8 +65,17 @@ class MemoryPoolTransferEngine {
                     size_t length, uint64_t* target_addr) const;
 
     // Export the MPU BO as a DMA-BUF. The returned fd is owned by the caller.
-    // Allocation does not retain a second fd or own the exported descriptor.
     int ExportDmaBuf(Allocation* allocation, int flags, int* dmabuf_fd) const;
+
+    // Import an externally exported DMA-BUF. The engine duplicates the fd and
+    // owns the duplicate until ReleaseDmaBuf(). No CPU mapping is performed.
+    // The importer deliberately does not claim that the MPU kernel driver has
+    // attached the DMA-BUF: that requires an MPU import ioctl, which is a
+    // separate kernel ABI step. This object is the Transfer Engine's lifetime
+    // and metadata boundary for the external DMA-BUF.
+    int ImportDmaBuf(int dmabuf_fd, uint64_t address, uint64_t length,
+                     DmaBufType type, ImportedDmaBuf* imported);
+    int ReleaseDmaBuf(ImportedDmaBuf* imported);
 
     // CPU mapping helpers. Mapping state is retained in Allocation::buf so the
     // ABI's mapped_len/cpu_addr checks remain authoritative.
