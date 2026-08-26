@@ -11,8 +11,9 @@ namespace mooncake {
 
 class MemoryPoolTransferEngine {
  public:
-    // Owns one MPU buffer object. The embedded ABI object is kept for the
-    // lifetime of the allocation so map/unmap state is never lost.
+    // Owns the userspace state associated with one MPU buffer object. The
+    // embedded ABI buffer is kept for the allocation lifetime so map/unmap
+    // state is never lost between calls.
     struct Allocation {
         uint32_t node_id = 0;
         amdgpu_mpu_buf_t buf{};
@@ -50,8 +51,8 @@ class MemoryPoolTransferEngine {
     int TargetRange(const Allocation& allocation, uint64_t offset,
                     size_t length, uint64_t* target_addr) const;
 
-    // Export the underlying MPU BO as a DMA-BUF. The returned fd is owned by
-    // Allocation and is closed when the allocation is destroyed/freed.
+    // Export the MPU BO as a DMA-BUF. The returned fd is owned by the caller;
+    // an internal duplicate is retained by Allocation until Free/destruction.
     int ExportDmaBuf(Allocation* allocation, int flags, int* dmabuf_fd) const;
 
     // CPU mapping helpers. Mapping state is retained in Allocation::buf so the
