@@ -1,6 +1,7 @@
 #include "transport/memory_pool_transport/memory_pool_transport.h"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -167,26 +168,21 @@ Status MemoryPoolTransport::submitTask(TransferTask* task) {
     task->slice_list.push_back(slice);
     __sync_fetch_and_add(&task->slice_count, 1);
 
-    // The current MPU ABI 1.8 exposes allocation/target-address/DMA-BUF/mmap,
-    // but no CPU-side memcpy primitive. Until the GPU/NIC DMA-BUF importer is
-    // connected, this transport intentionally uses the mapped target address
-    // for the host-visible validation path only.
+    // ABI 1.8 currently exposes allocation/target-address/DMA-BUF/mmap,
+    // but no CPU-side transfer primitive. This is the host-visible baseline
+    // path. GPU/NIC DMA-BUF import will replace this memcpy path without
+    // changing the Transport/TransferRequest interface.
     if (!request.source || !target_addr) {
         slice->markFailed();
         return Status::InvalidArgument("Invalid Memory Pool transfer address");
     }
 
     void* target = reinterpret_cast<void*>(target_addr);
-    int err = 0;
     if (request.opcode == TransferRequest::READ)
         std::memcpy(request.source, target, request.length);
     else
         std::memcpy(target, request.source, request.length);
 
-    if (err) {
-        slice->markFailed();
-        return Status::InternalError("Memory Pool host transfer failed");
-    }
     slice->markSuccess();
     return Status::OK();
 }
