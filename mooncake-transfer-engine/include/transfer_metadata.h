@@ -75,6 +75,11 @@ class TransferMetadata {
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
 
+        // Memory Pool/SUE target address. This is metadata owned by the
+        // CPU-side TransferMetadata and is intentionally distinct from addr,
+        // which retains the existing local-buffer address semantics.
+        uint64_t target_addr = 0;
+
         bool operator==(const BufferDesc &other) const = default;
     };
 
