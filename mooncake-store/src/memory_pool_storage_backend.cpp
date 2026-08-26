@@ -148,10 +148,6 @@ tl::expected<void, ErrorCode> MemoryPoolStorageBackend::TransferDeviceToPool(
     (void)source;
     (void)destination;
     (void)offset;
-    // The current MPU driver deliberately removed the old private XFER ioctl.
-    // The next data-path patch must import/export the GEM as DMA-BUF and bind
-    // it to the real GPU/NIC/SUE initiator path; do not silently fall back to
-    // a CPU memcpy because node-memory BOs are not CPU-mappable.
     LOG(ERROR) << "Memory Pool: GPU->MPU transfer is not exposed by the current "
                   "DRM UAPI; DMA-BUF/SUE transfer integration is required";
     return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -230,114 +226,31 @@ tl::expected<int64_t, ErrorCode> MemoryPoolStorageBackend::BatchOffload(
     std::function<ErrorCode(const std::vector<std::string>&,
                             std::vector<StorageObjectMetadata>&)> complete_handler,
     EvictionHandler eviction_handler) {
+    (void)batch_object;
+    (void)complete_handler;
+    (void)eviction_handler;
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    if (batch_object.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_KEY);
-    }
 
-    uint64_t batch_bytes = 0;
-    for (const auto& [key, slices] : batch_object) {
-        (void)key;
-        for (const auto& slice : slices) batch_bytes += slice.size;
-    }
-    auto evict_res = EvictForSpace(batch_bytes, eviction_handler);
-    if (!evict_res) return tl::make_unexpected(evict_res.error());
-
-    std::vector<std::string> success_keys;
-    std::vector<StorageObjectMetadata> metadatas;
-    success_keys.reserve(batch_object.size());
-    metadatas.reserve(batch_object.size());
-
-    for (const auto& [key, slices] : batch_object) {
-        uint64_t total = 0;
-        for (const auto& slice : slices) total += slice.size;
-        if (total == 0) continue;
-
-        Entry old_entry;
-        bool had_old = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = entries_.find(key);
-            if (it != entries_.end()) {
-                old_entry = it->second;
-                had_old = true;
-            }
-        }
-        if (had_old) {
-            auto free_res = Free(old_entry.allocation);
-            if (!free_res) continue;
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = entries_.find(key);
-            if (it != entries_.end() && it->second.sequence == old_entry.sequence) {
-                used_bytes_.fetch_sub(it->second.allocation.size,
-                                      std::memory_order_relaxed);
-                entries_.erase(it);
-            }
-        }
-
-        auto alloc_res = Allocate(total);
-        if (!alloc_res) continue;
-        Allocation allocation = alloc_res.value();
-
-        uint64_t offset = 0;
-        bool success = true;
-        for (const auto& slice : slices) {
-            auto xfer = TransferDeviceToPool(slice, allocation, offset);
-            if (!xfer) {
-                success = false;
-                break;
-            }
-            offset += slice.size;
-        }
-        if (!success) {
-            (void)Free(allocation);
-            continue;
-        }
-
-        const uint64_t seq = next_sequence_.fetch_add(1, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            entries_[key] = Entry{allocation, seq};
-        }
-        used_bytes_.fetch_add(allocation.size, std::memory_order_relaxed);
-        success_keys.push_back(key);
-        metadatas.push_back(StorageObjectMetadata{
-            0, static_cast<int64_t>(allocation.target_addr), 0,
-            static_cast<int64_t>(total), ""});
-    }
-
-    if (complete_handler && !success_keys.empty()) {
-        auto ec = complete_handler(success_keys, metadatas);
-        if (ec != ErrorCode::OK) return tl::make_unexpected(ec);
-    }
-    return static_cast<int64_t>(success_keys.size());
+    // Do not allocate and then claim success. The current driver exposes GEM
+    // allocation, target-address discovery and DMA-BUF export, but no data
+    // movement ioctl. The actual GPU/NIC transfer belongs in the next
+    // DMA-BUF/SUE transport layer.
+    LOG(ERROR) << "Memory Pool: BatchOffload requires the new DMA-BUF/SUE "
+                  "transfer path; current MPU UAPI has no XFER ioctl";
+    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
 }
 
 tl::expected<void, ErrorCode> MemoryPoolStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    (void)batched_slices;
     if (!initialized_.load(std::memory_order_acquire)) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
-    for (auto& [key, destination] : batched_slices) {
-        Entry entry;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = entries_.find(key);
-            if (it == entries_.end()) {
-                return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-            }
-            entry = it->second;
-        }
-        if (destination.size > entry.allocation.size) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        auto xfer = TransferPoolToDevice(entry.allocation, destination, 0);
-        if (!xfer) return xfer;
-    }
-    return {};
+    LOG(ERROR) << "Memory Pool: BatchLoad requires the new DMA-BUF/SUE "
+                  "transfer path; current MPU UAPI has no XFER ioctl";
+    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 }
 
 tl::expected<bool, ErrorCode> MemoryPoolStorageBackend::IsExist(
