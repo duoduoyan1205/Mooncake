@@ -12,6 +12,9 @@ namespace mooncake {
 
 class MemoryPoolTransport final : public Transport {
  public:
+    using DmaBufType = MemoryPoolTransferEngine::DmaBufType;
+    using ImportedDmaBuf = MemoryPoolTransferEngine::ImportedDmaBuf;
+
     MemoryPoolTransport();
     ~MemoryPoolTransport() override;
 
@@ -24,6 +27,18 @@ class MemoryPoolTransport final : public Transport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                               TransferStatus& status) override;
+
+    // Register an externally exported DMA-BUF with the Memory Pool transport.
+    // The importer takes ownership of a duplicated fd. No CPU mapping or
+    // memcpy is performed here. GPU and NIC callers use the same registration
+    // path and differ only by DmaBufType.
+    int importGpuDmaBuf(int dmabuf_fd, uint64_t device_addr, uint64_t length,
+                        ImportedDmaBuf* imported);
+    int importNicDmaBuf(int dmabuf_fd, uint64_t device_addr, uint64_t length,
+                        ImportedDmaBuf* imported);
+    int releaseDmaBuf(ImportedDmaBuf* imported);
+
+    MemoryPoolTransferEngine* engine() { return engine_.get(); }
 
  private:
     int install(std::string& local_server_name,
