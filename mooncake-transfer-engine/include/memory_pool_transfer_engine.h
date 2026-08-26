@@ -5,16 +5,28 @@
 #include <memory>
 #include <string>
 
+#include <libamdgpu_mpu.h>
+
 namespace mooncake {
 
 class MemoryPoolTransferEngine {
  public:
+    // Owns one MPU buffer object. The embedded ABI object is kept for the
+    // lifetime of the allocation so map/unmap state is never lost.
     struct Allocation {
         uint32_t node_id = 0;
-        uint64_t handle = 0;
-        uint64_t global_addr = 0;
-        uint64_t target_addr = 0;
-        uint64_t size = 0;
+        amdgpu_mpu_buf_t buf{};
+        int dmabuf_fd = -1;
+
+        Allocation() = default;
+        ~Allocation();
+        Allocation(Allocation&& other) noexcept;
+        Allocation& operator=(Allocation&& other) noexcept;
+        Allocation(const Allocation&) = delete;
+        Allocation& operator=(const Allocation&) = delete;
+
+        bool valid() const { return buf.handle != 0; }
+        bool mapped() const { return buf.cpu_addr != nullptr; }
     };
 
     MemoryPoolTransferEngine(std::string sueverbs_library,
@@ -24,8 +36,6 @@ class MemoryPoolTransferEngine {
     MemoryPoolTransferEngine(const MemoryPoolTransferEngine&) = delete;
     MemoryPoolTransferEngine& operator=(const MemoryPoolTransferEngine&) = delete;
 
-    // device_paths is a comma-separated list. Each device is one equivalent
-    // Memory Pool node. Placement is intentionally round-robin.
     int Open();
     void Close();
 
@@ -35,21 +45,20 @@ class MemoryPoolTransferEngine {
     uint64_t NodeCapacity(uint32_t node_id) const;
 
     int Allocate(uint64_t size, Allocation* allocation);
-    int Free(const Allocation& allocation);
+    int Free(Allocation* allocation);
 
-    // Return the Memory Pool target address for a range within an allocation.
     int TargetRange(const Allocation& allocation, uint64_t offset,
                     size_t length, uint64_t* target_addr) const;
 
-    // Export the underlying MPU BO as a DMA-BUF. The caller owns the returned
-    // file descriptor and must close it when it is no longer needed.
-    int ExportDmaBuf(const Allocation& allocation, int flags,
-                     int* dmabuf_fd) const;
+    // Export the underlying MPU BO as a DMA-BUF. The returned fd is owned by
+    // Allocation and is closed when the allocation is destroyed/freed.
+    int ExportDmaBuf(Allocation* allocation, int flags, int* dmabuf_fd) const;
 
-    // CPU mapping helpers for software-backed MPU pool memory.
-    int Map(const Allocation& allocation, size_t offset, size_t length,
+    // CPU mapping helpers. Mapping state is retained in Allocation::buf so the
+    // ABI's mapped_len/cpu_addr checks remain authoritative.
+    int Map(Allocation* allocation, size_t offset, size_t length,
             void** cpu_addr);
-    int Unmap(const Allocation& allocation, size_t length);
+    int Unmap(Allocation* allocation, size_t length);
 
  private:
     struct Api;
