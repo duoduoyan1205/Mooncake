@@ -13,14 +13,8 @@ class MemoryPoolTransferEngine {
         uint32_t node_id = 0;
         uint64_t handle = 0;
         uint64_t global_addr = 0;
+        uint64_t target_addr = 0;
         uint64_t size = 0;
-    };
-
-    enum class AccessPath : uint32_t {
-        kPToD = 0,
-        kDToP = 1,
-        kDToPool = 2,
-        kPoolToD = 3,
     };
 
     MemoryPoolTransferEngine(std::string sueverbs_library,
@@ -43,17 +37,19 @@ class MemoryPoolTransferEngine {
     int Allocate(uint64_t size, Allocation* allocation);
     int Free(const Allocation& allocation);
 
-    int Transfer(AccessPath path, uint32_t node_id, uint64_t source_addr,
-                 uint64_t target_addr, size_t length);
+    // Return the Memory Pool target address for a range within an allocation.
+    int TargetRange(const Allocation& allocation, uint64_t offset,
+                    size_t length, uint64_t* target_addr) const;
 
-    int TransferPToD(uint32_t node_id, uint64_t source_addr,
-                     uint64_t target_addr, size_t length);
-    int TransferDToP(uint32_t node_id, uint64_t source_addr,
-                     uint64_t target_addr, size_t length);
-    int TransferDToPool(const Allocation& allocation, uint64_t source_addr,
-                        size_t length, uint64_t offset = 0);
-    int TransferPoolToD(const Allocation& allocation, uint64_t target_addr,
-                        size_t length, uint64_t offset = 0);
+    // Export the underlying MPU BO as a DMA-BUF. The caller owns the returned
+    // file descriptor and must close it when it is no longer needed.
+    int ExportDmaBuf(const Allocation& allocation, int flags,
+                     int* dmabuf_fd) const;
+
+    // CPU mapping helpers for software-backed MPU pool memory.
+    int Map(const Allocation& allocation, size_t offset, size_t length,
+            void** cpu_addr);
+    int Unmap(const Allocation& allocation, size_t length);
 
  private:
     struct Api;
