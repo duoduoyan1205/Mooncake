@@ -1,10 +1,13 @@
 #include "memory_pool_transfer_engine.h"
 
 #include <cerrno>
+#include <fcntl.h>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -29,9 +32,10 @@ std::vector<std::string> SplitDevices(const std::string& devices) {
 MemoryPoolTransferEngine::Allocation::~Allocation() = default;
 
 MemoryPoolTransferEngine::Allocation::Allocation(Allocation&& other) noexcept
-    : node_id(other.node_id), buf(other.buf) {
+    : node_id(other.node_id), buf(other.buf), dmabuf_fd(other.dmabuf_fd) {
     other.node_id = 0;
     other.buf = {};
+    other.dmabuf_fd = -1;
 }
 
 MemoryPoolTransferEngine::Allocation&
@@ -39,8 +43,10 @@ MemoryPoolTransferEngine::Allocation::operator=(Allocation&& other) noexcept {
     if (this == &other) return *this;
     node_id = other.node_id;
     buf = other.buf;
+    dmabuf_fd = other.dmabuf_fd;
     other.node_id = 0;
     other.buf = {};
+    other.dmabuf_fd = -1;
     return *this;
 }
 
@@ -198,6 +204,35 @@ int MemoryPoolTransferEngine::ExportDmaBuf(Allocation* allocation, int flags,
     return amdgpu_mpu_bo_export_dmabuf(
         context_->nodes[allocation->node_id].ctx, &allocation->buf, flags,
         dmabuf_fd);
+}
+
+int MemoryPoolTransferEngine::ImportDmaBuf(
+    int dmabuf_fd, uint64_t address, uint64_t length, DmaBufType type,
+    ImportedDmaBuf* imported) {
+    if (!IsOpen() || !imported || dmabuf_fd < 0 || !length) return -EINVAL;
+    if (imported->valid()) return -EBUSY;
+
+    struct stat st{};
+    if (fstat(dmabuf_fd, &st) != 0) return -errno;
+
+    // DMA-BUFs are anonymous file descriptors. Requiring a non-zero st_size
+    // would reject valid exporters, so only validate that the fd is usable.
+    const int dup_fd = fcntl(dmabuf_fd, F_DUPFD_CLOEXEC, 0);
+    if (dup_fd < 0) return -errno;
+
+    imported->fd = dup_fd;
+    imported->length = length;
+    imported->address = address;
+    imported->type = type;
+    return 0;
+}
+
+int MemoryPoolTransferEngine::ReleaseDmaBuf(ImportedDmaBuf* imported) {
+    if (!imported || !imported->valid()) return 0;
+    const int rc = close(imported->fd);
+    if (rc != 0) return -errno;
+    *imported = {};
+    return 0;
 }
 
 int MemoryPoolTransferEngine::Map(Allocation* allocation, size_t offset,
