@@ -6,10 +6,9 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <utility>
 #include <vector>
-
-#include <libamdgpu_mpu.h>
 
 namespace mooncake {
 namespace {
@@ -48,6 +47,33 @@ std::vector<std::string> SplitDevices(const std::string& devices) {
     return result;
 }
 }  // namespace
+
+MemoryPoolTransferEngine::Allocation::~Allocation() {
+    if (dmabuf_fd >= 0) {
+        close(dmabuf_fd);
+        dmabuf_fd = -1;
+    }
+}
+
+MemoryPoolTransferEngine::Allocation::Allocation(Allocation&& other) noexcept
+    : node_id(other.node_id), buf(other.buf), dmabuf_fd(other.dmabuf_fd) {
+    other.node_id = 0;
+    other.buf = {};
+    other.dmabuf_fd = -1;
+}
+
+MemoryPoolTransferEngine::Allocation&
+MemoryPoolTransferEngine::Allocation::operator=(Allocation&& other) noexcept {
+    if (this == &other) return *this;
+    if (dmabuf_fd >= 0) close(dmabuf_fd);
+    node_id = other.node_id;
+    buf = other.buf;
+    dmabuf_fd = other.dmabuf_fd;
+    other.node_id = 0;
+    other.buf = {};
+    other.dmabuf_fd = -1;
+    return *this;
+}
 
 struct MemoryPoolTransferEngine::Api {
     FnOpen open = nullptr;
@@ -107,10 +133,8 @@ int MemoryPoolTransferEngine::Open() {
         LoadSymbol(context_->library_handle, "amdgpu_mpu_get_caps", &api.get_caps) &&
         LoadSymbol(context_->library_handle, "amdgpu_mpu_alloc_node", &api.alloc_node) &&
         LoadSymbol(context_->library_handle, "amdgpu_mpu_free", &api.free) &&
-        LoadSymbol(context_->library_handle, "amdgpu_mpu_bo_export_dmabuf",
-                   &api.export_dmabuf) &&
-        LoadSymbol(context_->library_handle, "amdgpu_mpu_target_range",
-                   &api.target_range) &&
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_bo_export_dmabuf", &api.export_dmabuf) &&
+        LoadSymbol(context_->library_handle, "amdgpu_mpu_target_range", &api.target_range) &&
         LoadSymbol(context_->library_handle, "amdgpu_mpu_bo_map", &api.bo_map) &&
         LoadSymbol(context_->library_handle, "amdgpu_mpu_bo_unmap", &api.bo_unmap);
     if (!loaded) {
@@ -187,6 +211,7 @@ uint64_t MemoryPoolTransferEngine::Capacity() const {
 
 int MemoryPoolTransferEngine::Allocate(uint64_t size, Allocation* allocation) {
     if (!IsOpen() || !allocation || !size) return -EINVAL;
+    if (allocation->valid()) return -EBUSY;
     if (size > std::numeric_limits<uint64_t>::max() - (kAlignment - 1))
         return -EINVAL;
     const uint64_t aligned = (size + kAlignment - 1) & ~(kAlignment - 1);
@@ -196,87 +221,85 @@ int MemoryPoolTransferEngine::Allocate(uint64_t size, Allocation* allocation) {
         context_->next_node++ % context_->nodes.size());
     Node& node = context_->nodes[node_id];
 
-    amdgpu_mpu_buf_t buf{};
-    const int rc = context_->api->alloc_node(node.ctx, aligned, kAlignment, &buf);
+    allocation->buf = {};
+    const int rc = context_->api->alloc_node(node.ctx, aligned, kAlignment,
+                                              &allocation->buf);
     if (rc) return rc;
 
     allocation->node_id = node_id;
-    allocation->handle = buf.handle;
-    allocation->global_addr = buf.global_addr;
-    allocation->target_addr = buf.target_addr;
-    allocation->size = buf.size;
+    allocation->dmabuf_fd = -1;
     return 0;
 }
 
-int MemoryPoolTransferEngine::Free(const Allocation& allocation) {
-    if (!IsOpen() || !allocation.handle) return 0;
-    if (allocation.node_id >= context_->nodes.size()) return -EINVAL;
-    Node& node = context_->nodes[allocation.node_id];
-    amdgpu_mpu_buf_t buf{};
-    buf.handle = allocation.handle;
-    buf.global_addr = allocation.global_addr;
-    buf.target_addr = allocation.target_addr;
-    buf.size = allocation.size;
-    return context_->api->free(node.ctx, &buf);
+int MemoryPoolTransferEngine::Free(Allocation* allocation) {
+    if (!allocation || !allocation->valid()) return 0;
+    if (!IsOpen()) return -ENODEV;
+    if (allocation->node_id >= context_->nodes.size()) return -EINVAL;
+    if (allocation->mapped()) return -EBUSY;
+
+    Node& node = context_->nodes[allocation->node_id];
+    const int rc = context_->api->free(node.ctx, &allocation->buf);
+    if (rc) return rc;
+
+    if (allocation->dmabuf_fd >= 0) {
+        close(allocation->dmabuf_fd);
+        allocation->dmabuf_fd = -1;
+    }
+    allocation->buf = {};
+    allocation->node_id = 0;
+    return 0;
 }
 
 int MemoryPoolTransferEngine::TargetRange(const Allocation& allocation,
                                           uint64_t offset, size_t length,
                                           uint64_t* target_addr) const {
-    if (!IsOpen() || !allocation.handle || !target_addr)
-        return -EINVAL;
+    if (!IsOpen() || !allocation.valid() || !target_addr) return -EINVAL;
     if (allocation.node_id >= context_->nodes.size()) return -EINVAL;
-    amdgpu_mpu_buf_t buf{};
-    buf.handle = allocation.handle;
-    buf.global_addr = allocation.global_addr;
-    buf.target_addr = allocation.target_addr;
-    buf.size = allocation.size;
-    return context_->api->target_range(&buf, offset, length, target_addr);
+    return context_->api->target_range(&allocation.buf, offset, length,
+                                       target_addr);
 }
 
-int MemoryPoolTransferEngine::ExportDmaBuf(const Allocation& allocation,
-                                            int flags, int* dmabuf_fd) const {
-    if (!IsOpen() || !allocation.handle || !dmabuf_fd)
+int MemoryPoolTransferEngine::ExportDmaBuf(Allocation* allocation, int flags,
+                                            int* dmabuf_fd) const {
+    if (!IsOpen() || !allocation || !allocation->valid() || !dmabuf_fd)
         return -EINVAL;
-    if (allocation.node_id >= context_->nodes.size()) return -EINVAL;
-    amdgpu_mpu_buf_t buf{};
-    buf.handle = allocation.handle;
-    buf.global_addr = allocation.global_addr;
-    buf.target_addr = allocation.target_addr;
-    buf.size = allocation.size;
-    return context_->api->export_dmabuf(context_->nodes[allocation.node_id].ctx,
-                                        &buf, flags, dmabuf_fd);
-}
+    if (allocation->node_id >= context_->nodes.size()) return -EINVAL;
+    if (allocation->dmabuf_fd >= 0) return -EBUSY;
 
-int MemoryPoolTransferEngine::Map(const Allocation& allocation, size_t offset,
-                                  size_t length, void** cpu_addr) {
-    if (!IsOpen() || !allocation.handle || !cpu_addr)
-        return -EINVAL;
-    if (allocation.node_id >= context_->nodes.size()) return -EINVAL;
-    if (offset > allocation.size || length > allocation.size - offset)
-        return -EINVAL;
-
-    amdgpu_mpu_buf_t buf{};
-    buf.handle = allocation.handle;
-    buf.global_addr = allocation.global_addr;
-    buf.target_addr = allocation.target_addr;
-    buf.size = allocation.size;
-    const int rc = context_->api->bo_map(
-        context_->nodes[allocation.node_id].ctx, &buf, offset, length);
+    const int rc = context_->api->export_dmabuf(
+        context_->nodes[allocation->node_id].ctx, &allocation->buf, flags,
+        dmabuf_fd);
     if (rc) return rc;
-    *cpu_addr = buf.cpu_addr;
+    allocation->dmabuf_fd = *dmabuf_fd;
     return 0;
 }
 
-int MemoryPoolTransferEngine::Unmap(const Allocation& allocation, size_t length) {
-    if (!IsOpen() || !allocation.handle) return -EINVAL;
-    if (allocation.node_id >= context_->nodes.size()) return -EINVAL;
-    amdgpu_mpu_buf_t buf{};
-    buf.handle = allocation.handle;
-    buf.global_addr = allocation.global_addr;
-    buf.target_addr = allocation.target_addr;
-    buf.size = allocation.size;
-    return context_->api->bo_unmap(&buf, length);
+int MemoryPoolTransferEngine::Map(Allocation* allocation, size_t offset,
+                                  size_t length, void** cpu_addr) {
+    if (!IsOpen() || !allocation || !allocation->valid() || !cpu_addr)
+        return -EINVAL;
+    if (allocation->node_id >= context_->nodes.size()) return -EINVAL;
+    if (allocation->mapped()) return -EBUSY;
+    if (offset > allocation->buf.size || length > allocation->buf.size - offset)
+        return -EINVAL;
+
+    const int rc = context_->api->bo_map(
+        context_->nodes[allocation->node_id].ctx, &allocation->buf, offset,
+        length);
+    if (rc) return rc;
+    *cpu_addr = allocation->buf.cpu_addr;
+    return 0;
+}
+
+int MemoryPoolTransferEngine::Unmap(Allocation* allocation, size_t length) {
+    if (!IsOpen() || !allocation || !allocation->valid()) return -EINVAL;
+    if (allocation->node_id >= context_->nodes.size()) return -EINVAL;
+    if (!allocation->mapped()) return -EINVAL;
+    if (length != allocation->buf.mapped_len) return -EINVAL;
+
+    const int rc = context_->api->bo_unmap(&allocation->buf, length);
+    if (rc) return rc;
+    return 0;
 }
 
 }  // namespace mooncake
