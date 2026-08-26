@@ -6,13 +6,67 @@ add_subdirectory(transport)
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-# The Memory Pool backend uses the public userspace ABI exported by the
-# amdgpu-mpu library.  The kernel UAPI is intentionally not included here.
-set(AMDGPU_MPU_INCLUDE_DIR "/usr/local/include" CACHE PATH
-    "Directory containing libamdgpu_mpu.h")
-if(EXISTS "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
-  include_directories(${AMDGPU_MPU_INCLUDE_DIR})
+# ---------------------------------------------------------------------------
+# AMDGPU-MPU ABI 1.8
+# ---------------------------------------------------------------------------
+# memory_pool_transfer_engine.cpp consumes the public userspace ABI directly.
+# Make the dependency explicit: do not silently compile the source with a
+# missing/old header and do not rely on an incidental include path.
+set(AMDGPU_MPU_ROOT "" CACHE PATH
+    "AMDGPU-MPU installation/prefix containing include/ and lib/")
+set(AMDGPU_MPU_INCLUDE_DIR "" CACHE PATH
+    "Directory containing the ABI 1.8 libamdgpu_mpu.h")
+set(AMDGPU_MPU_LIBRARY "" CACHE FILEPATH
+    "ABI 1.8 libamdgpu_mpu.so")
+
+if(AMDGPU_MPU_ROOT)
+  if(NOT AMDGPU_MPU_INCLUDE_DIR)
+    set(AMDGPU_MPU_INCLUDE_DIR "${AMDGPU_MPU_ROOT}/include")
+  endif()
+  if(NOT AMDGPU_MPU_LIBRARY)
+    set(AMDGPU_MPU_LIBRARY "${AMDGPU_MPU_ROOT}/lib/libamdgpu_mpu.so")
+  endif()
 endif()
+
+if(NOT AMDGPU_MPU_INCLUDE_DIR)
+  find_path(AMDGPU_MPU_INCLUDE_DIR
+    NAMES libamdgpu_mpu.h
+    PATHS /usr/local/include /usr/include
+    NO_DEFAULT_PATH)
+endif()
+
+if(NOT AMDGPU_MPU_LIBRARY)
+  find_library(AMDGPU_MPU_LIBRARY
+    NAMES amdgpu_mpu libamdgpu_mpu
+    PATHS /usr/local/lib /usr/lib /usr/lib64
+    NO_DEFAULT_PATH)
+endif()
+
+if(NOT AMDGPU_MPU_INCLUDE_DIR OR
+   NOT EXISTS "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
+  message(FATAL_ERROR
+    "AMDGPU-MPU ABI 1.8 header not found. "
+    "Set AMDGPU_MPU_ROOT or AMDGPU_MPU_INCLUDE_DIR.")
+endif()
+
+if(NOT AMDGPU_MPU_LIBRARY OR NOT EXISTS "${AMDGPU_MPU_LIBRARY}")
+  message(FATAL_ERROR
+    "AMDGPU-MPU ABI 1.8 library not found. "
+    "Set AMDGPU_MPU_ROOT or AMDGPU_MPU_LIBRARY.")
+endif()
+
+# Keep this as a target-scoped dependency rather than a global include path.
+# The library is loaded through dlopen/dlsym by the MPU adapter, but linking
+# it explicitly here documents and validates the ABI dependency at configure
+# time and makes the runtime search path deterministic.
+target_include_directories(transfer_engine PRIVATE "${AMDGPU_MPU_INCLUDE_DIR}")
+target_link_libraries(transfer_engine PRIVATE "${AMDGPU_MPU_LIBRARY}")
+get_filename_component(AMDGPU_MPU_LIBRARY_DIR
+  "${AMDGPU_MPU_LIBRARY}" DIRECTORY)
+set_property(TARGET transfer_engine APPEND PROPERTY
+  BUILD_RPATH "${AMDGPU_MPU_LIBRARY_DIR}")
+set_property(TARGET transfer_engine APPEND PROPERTY
+  INSTALL_RPATH "${AMDGPU_MPU_LIBRARY_DIR}")
 
 if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
@@ -109,8 +163,6 @@ if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 
-  # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
-  # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
   option(USE_HIP_DMABUF "Enable HIP dmabuf MR registration" ON)
   if(USE_HIP_DMABUF)
     find_package(hsa-runtime64 CONFIG)
