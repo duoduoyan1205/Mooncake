@@ -5,7 +5,6 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -27,30 +26,21 @@ std::vector<std::string> SplitDevices(const std::string& devices) {
 }
 }  // namespace
 
-MemoryPoolTransferEngine::Allocation::~Allocation() {
-    if (dmabuf_fd >= 0) {
-        close(dmabuf_fd);
-        dmabuf_fd = -1;
-    }
-}
+MemoryPoolTransferEngine::Allocation::~Allocation() = default;
 
 MemoryPoolTransferEngine::Allocation::Allocation(Allocation&& other) noexcept
-    : node_id(other.node_id), buf(other.buf), dmabuf_fd(other.dmabuf_fd) {
+    : node_id(other.node_id), buf(other.buf) {
     other.node_id = 0;
     other.buf = {};
-    other.dmabuf_fd = -1;
 }
 
 MemoryPoolTransferEngine::Allocation&
 MemoryPoolTransferEngine::Allocation::operator=(Allocation&& other) noexcept {
     if (this == &other) return *this;
-    if (dmabuf_fd >= 0) close(dmabuf_fd);
     node_id = other.node_id;
     buf = other.buf;
-    dmabuf_fd = other.dmabuf_fd;
     other.node_id = 0;
     other.buf = {};
-    other.dmabuf_fd = -1;
     return *this;
 }
 
@@ -66,6 +56,7 @@ struct MemoryPoolTransferEngine::Context {
 
     std::vector<Node> nodes;
     uint64_t next_node = 0;
+    size_t active_allocations = 0;
     mutable std::mutex mutex;
 };
 
@@ -108,6 +99,12 @@ int MemoryPoolTransferEngine::Open() {
 
 void MemoryPoolTransferEngine::Close() {
     if (!context_) return;
+
+    std::lock_guard<std::mutex> lock(context_->mutex);
+    // Allocation owns the MPU BO lifetime. Never invalidate its node contexts
+    // while an allocation is live; callers must Free() all allocations first.
+    if (context_->active_allocations != 0) return;
+
     for (auto& node : context_->nodes) {
         if (node.ctx) amdgpu_mpu_close(node.ctx);
         node.ctx = nullptr;
@@ -163,7 +160,7 @@ int MemoryPoolTransferEngine::Allocate(uint64_t size, Allocation* allocation) {
     if (rc) return rc;
 
     allocation->node_id = node_id;
-    allocation->dmabuf_fd = -1;
+    ++context_->active_allocations;
     return 0;
 }
 
@@ -173,16 +170,14 @@ int MemoryPoolTransferEngine::Free(Allocation* allocation) {
     if (allocation->node_id >= context_->nodes.size()) return -EINVAL;
     if (allocation->mapped()) return -EBUSY;
 
+    std::lock_guard<std::mutex> lock(context_->mutex);
     Node& node = context_->nodes[allocation->node_id];
     const int rc = amdgpu_mpu_free(node.ctx, &allocation->buf);
     if (rc) return rc;
 
-    if (allocation->dmabuf_fd >= 0) {
-        close(allocation->dmabuf_fd);
-        allocation->dmabuf_fd = -1;
-    }
     allocation->buf = {};
     allocation->node_id = 0;
+    if (context_->active_allocations != 0) --context_->active_allocations;
     return 0;
 }
 
@@ -199,24 +194,10 @@ int MemoryPoolTransferEngine::ExportDmaBuf(Allocation* allocation, int flags,
     if (!IsOpen() || !allocation || !allocation->valid() || !dmabuf_fd)
         return -EINVAL;
     if (allocation->node_id >= context_->nodes.size()) return -EINVAL;
-    if (allocation->dmabuf_fd >= 0) return -EBUSY;
 
-    int exported_fd = -1;
-    const int rc = amdgpu_mpu_bo_export_dmabuf(
+    return amdgpu_mpu_bo_export_dmabuf(
         context_->nodes[allocation->node_id].ctx, &allocation->buf, flags,
-        &exported_fd);
-    if (rc) return rc;
-
-    const int owned_fd = dup(exported_fd);
-    if (owned_fd < 0) {
-        const int saved_errno = errno;
-        close(exported_fd);
-        return -saved_errno;
-    }
-
-    allocation->dmabuf_fd = owned_fd;
-    *dmabuf_fd = exported_fd;
-    return 0;
+        dmabuf_fd);
 }
 
 int MemoryPoolTransferEngine::Map(Allocation* allocation, size_t offset,
