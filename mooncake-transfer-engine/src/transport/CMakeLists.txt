@@ -8,6 +8,11 @@ target_link_libraries(
   transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog
                     pthread)
 
+if(USE_MEMORY_POOL)
+  add_subdirectory(memory_pool_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:memory_pool_transport>)
+endif()
+
 if(USE_UB)
   add_subdirectory(kunpeng_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:ub_transport>)
