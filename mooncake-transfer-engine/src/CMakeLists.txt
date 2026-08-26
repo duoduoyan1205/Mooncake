@@ -58,10 +58,8 @@ endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 
-# The MPU adapter consumes the public ABI header and shared library. Keep the
-# dependency target-scoped and explicit; the adapter may still use dlopen/dlsym
-# internally for symbol resolution, but configuration/build must validate that
-# the ABI 1.8 installation is present.
+# The MPU adapter consumes the public ABI header and shared library directly.
+# There is no dlopen/dlsym layer: ABI 1.8 is a real compile/link dependency.
 target_include_directories(transfer_engine PRIVATE "${AMDGPU_MPU_INCLUDE_DIR}")
 target_link_libraries(transfer_engine PRIVATE "${AMDGPU_MPU_LIBRARY}")
 get_filename_component(AMDGPU_MPU_LIBRARY_DIR
