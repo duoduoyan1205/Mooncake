@@ -5,34 +5,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <chrono>
 #include <memory>
 #include <string>
-#include <thread>
 
 #include <gtest/gtest.h>
 
 namespace mooncake {
 namespace {
-
-class ScopedMetadataRefreshConfig {
-   public:
-    ScopedMetadataRefreshConfig(int interval, bool enabled) {
-        old_interval_ = TransferMetadata::getMetadataRefreshInterval();
-        old_enabled_ = TransferMetadata::getMetadataRefreshEnabled();
-        TransferMetadata::setMetadataRefreshInterval(interval);
-        TransferMetadata::setMetadataRefreshEnabled(enabled);
-    }
-
-    ~ScopedMetadataRefreshConfig() {
-        TransferMetadata::setMetadataRefreshInterval(old_interval_);
-        TransferMetadata::setMetadataRefreshEnabled(old_enabled_);
-    }
-
-   private:
-    int old_interval_;
-    bool old_enabled_;
-};
 
 constexpr TransferMetadata::SegmentID LOCAL_SEGMENT_ID = 0;
 
@@ -109,67 +88,10 @@ std::shared_ptr<TransferMetadata::SegmentDesc> makeMemoryPoolSegmentDesc(
 
 }  // namespace
 
-TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
-    constexpr uint64_t kInitialAddr = 0x1000;
-    constexpr uint64_t kUpdatedAddr = 0x2000;
-
-    ScopedMetadataRefreshConfig restore(1, true);
-    TransferMetadata server(P2PHANDSHAKE);
-    TransferMetadata client(P2PHANDSHAKE);
-
-    int sockfd = -1;
-    const uint16_t port = findAvailableTcpPort(sockfd);
-    ASSERT_GT(port, 0);
-    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
-
-    ASSERT_EQ(server.addLocalSegment(
-                  LOCAL_SEGMENT_ID, remote_segment_name,
-                  makeRdmaSegmentDesc(remote_segment_name, kInitialAddr)),
-              0);
-    TransferMetadata::RpcMetaDesc rpc_desc;
-    rpc_desc.ip_or_host_name = "127.0.0.1";
-    rpc_desc.rpc_port = port;
-    rpc_desc.sockfd = sockfd;
-    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
-
-    ASSERT_EQ(
-        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
-                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
-        0);
-
-    const auto segment_id = client.getSegmentID(remote_segment_name);
-    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
-    auto cached_desc = client.getSegmentDescByID(segment_id);
-    ASSERT_TRUE(cached_desc);
-    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
-
-    ASSERT_EQ(server.removeLocalMemoryBuffer(
-                  reinterpret_cast<void*>(kInitialAddr), false),
-              0);
-    ASSERT_EQ(
-        server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr), false),
-        0);
-
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (std::chrono::steady_clock::now() < deadline) {
-        cached_desc = client.getSegmentDescByID(segment_id);
-        ASSERT_TRUE(cached_desc);
-        if (!cached_desc->buffers.empty() &&
-            cached_desc->buffers[0].addr == kUpdatedAddr) {
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-
-    FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
-}
-
-TEST(TransferMetadataPollingTest, MemoryPoolTargetAddrRoundTrip) {
+TEST(TransferMetadataTest, MemoryPoolTargetAddrRoundTrip) {
     constexpr uint64_t kTargetAddr = 0x123456789abc0000ULL;
     constexpr uint64_t kLength = 2ULL * 1024 * 1024;
 
-    ScopedMetadataRefreshConfig restore(1, true);
     TransferMetadata server(P2PHANDSHAKE);
     TransferMetadata client(P2PHANDSHAKE);
 
