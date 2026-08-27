@@ -45,8 +45,10 @@ endif()
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 
 if(USE_MEMORY_POOL)
-  # The MPU adapter consumes the public userspace ABI directly.
-  target_include_directories(transfer_engine PRIVATE
+  # memory_pool_transfer_engine.h is a public Transfer Engine header, so the
+  # MPU include directory must be PUBLIC as well. This is required when tests
+  # or other targets include that header directly.
+  target_include_directories(transfer_engine PUBLIC
     "${AMDGPU_MPU_INCLUDE_DIR}")
   target_link_libraries(transfer_engine PRIVATE
     "${AMDGPU_MPU_LIBRARY}")
