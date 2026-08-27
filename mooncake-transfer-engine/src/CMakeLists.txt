@@ -7,49 +7,35 @@ add_subdirectory(transport)
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 # ---------------------------------------------------------------------------
-# AMDGPU-MPU ABI 1.8
+# AMDGPU-MPU userspace library
 # ---------------------------------------------------------------------------
-set(AMDGPU_MPU_ROOT "" CACHE PATH
-    "AMDGPU-MPU installation/prefix containing include/ and lib/")
-set(AMDGPU_MPU_INCLUDE_DIR "" CACHE PATH
-    "Directory containing the ABI 1.8 libamdgpu_mpu.h")
-set(AMDGPU_MPU_LIBRARY "" CACHE FILEPATH
-    "ABI 1.8 libamdgpu_mpu.so")
+# The amdgpu-mpu project exports a small public userspace ABI consisting of
+# lib/libamdgpu_mpu.h and lib/libamdgpu-mpu.so. Keep the dependency explicit
+# and tied to the source tree used for local MPU development.
+if(USE_MEMORY_POOL)
+  set(AMDGPU_MPU_DIR "" CACHE PATH
+      "Root directory of the amdgpu-mpu project")
 
-if(AMDGPU_MPU_ROOT)
-  if(NOT AMDGPU_MPU_INCLUDE_DIR)
-    set(AMDGPU_MPU_INCLUDE_DIR "${AMDGPU_MPU_ROOT}/include")
+  if(NOT AMDGPU_MPU_DIR)
+    message(FATAL_ERROR
+      "USE_MEMORY_POOL=ON requires AMDGPU_MPU_DIR, "
+      "e.g. -DAMDGPU_MPU_DIR=/home/yanwei3/work/amdgpu-mpu")
   endif()
-  if(NOT AMDGPU_MPU_LIBRARY)
-    set(AMDGPU_MPU_LIBRARY "${AMDGPU_MPU_ROOT}/lib/libamdgpu_mpu.so")
+
+  set(AMDGPU_MPU_INCLUDE_DIR "${AMDGPU_MPU_DIR}/lib")
+  set(AMDGPU_MPU_LIBRARY "${AMDGPU_MPU_DIR}/lib/libamdgpu-mpu.so")
+
+  if(NOT EXISTS "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
+    message(FATAL_ERROR
+      "AMDGPU-MPU header not found: "
+      "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
   endif()
-endif()
 
-if(NOT AMDGPU_MPU_INCLUDE_DIR)
-  find_path(AMDGPU_MPU_INCLUDE_DIR
-    NAMES libamdgpu_mpu.h
-    PATHS /usr/local/include /usr/include
-    NO_DEFAULT_PATH)
-endif()
-
-if(NOT AMDGPU_MPU_LIBRARY)
-  find_library(AMDGPU_MPU_LIBRARY
-    NAMES amdgpu_mpu libamdgpu_mpu
-    PATHS /usr/local/lib /usr/lib /usr/lib64
-    NO_DEFAULT_PATH)
-endif()
-
-if(NOT AMDGPU_MPU_INCLUDE_DIR OR
-   NOT EXISTS "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
-  message(FATAL_ERROR
-    "AMDGPU-MPU ABI 1.8 header not found. "
-    "Set AMDGPU_MPU_ROOT or AMDGPU_MPU_INCLUDE_DIR.")
-endif()
-
-if(NOT AMDGPU_MPU_LIBRARY OR NOT EXISTS "${AMDGPU_MPU_LIBRARY}")
-  message(FATAL_ERROR
-    "AMDGPU-MPU ABI 1.8 library not found. "
-    "Set AMDGPU_MPU_ROOT or AMDGPU_MPU_LIBRARY.")
+  if(NOT EXISTS "${AMDGPU_MPU_LIBRARY}")
+    message(FATAL_ERROR
+      "AMDGPU-MPU library not found: "
+      "${AMDGPU_MPU_LIBRARY}")
+  endif()
 endif()
 
 if(USE_HIP)
@@ -58,16 +44,20 @@ endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 
-# The MPU adapter consumes the public ABI header and shared library directly.
-# There is no dlopen/dlsym layer: ABI 1.8 is a real compile/link dependency.
-target_include_directories(transfer_engine PRIVATE "${AMDGPU_MPU_INCLUDE_DIR}")
-target_link_libraries(transfer_engine PRIVATE "${AMDGPU_MPU_LIBRARY}")
-get_filename_component(AMDGPU_MPU_LIBRARY_DIR
-  "${AMDGPU_MPU_LIBRARY}" DIRECTORY)
-set_property(TARGET transfer_engine APPEND PROPERTY
-  BUILD_RPATH "${AMDGPU_MPU_LIBRARY_DIR}")
-set_property(TARGET transfer_engine APPEND PROPERTY
-  INSTALL_RPATH "${AMDGPU_MPU_LIBRARY_DIR}")
+if(USE_MEMORY_POOL)
+  # The MPU adapter consumes the public userspace ABI directly.
+  target_include_directories(transfer_engine PRIVATE
+    "${AMDGPU_MPU_INCLUDE_DIR}")
+  target_link_libraries(transfer_engine PRIVATE
+    "${AMDGPU_MPU_LIBRARY}")
+
+  get_filename_component(AMDGPU_MPU_LIBRARY_DIR
+    "${AMDGPU_MPU_LIBRARY}" DIRECTORY)
+  set_property(TARGET transfer_engine APPEND PROPERTY
+    BUILD_RPATH "${AMDGPU_MPU_LIBRARY_DIR}")
+  set_property(TARGET transfer_engine APPEND PROPERTY
+    INSTALL_RPATH "${AMDGPU_MPU_LIBRARY_DIR}")
+endif()
 
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
