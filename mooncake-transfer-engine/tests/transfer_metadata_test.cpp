@@ -13,8 +13,6 @@
 namespace mooncake {
 namespace {
 
-constexpr TransferMetadata::SegmentID LOCAL_SEGMENT_ID = 0;
-
 uint16_t findAvailableTcpPort(int& sockfd) {
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) return 0;
@@ -44,31 +42,6 @@ uint16_t findAvailableTcpPort(int& sockfd) {
         return 0;
     }
     return ntohs(addr.sin_port);
-}
-
-TransferMetadata::BufferDesc makeRdmaBufferDesc(uint64_t addr) {
-    TransferMetadata::BufferDesc buffer_desc;
-    buffer_desc.name = "rdma_buffer";
-    buffer_desc.addr = addr;
-    buffer_desc.length = 4096;
-    return buffer_desc;
-}
-
-std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
-    const std::string& name, uint64_t addr) {
-    auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
-    segment_desc->name = name;
-    segment_desc->protocol = "rdma";
-    segment_desc->tcp_data_port = 0;
-
-    TransferMetadata::DeviceDesc device_desc;
-    device_desc.name = "mlx5_0";
-    device_desc.lid = 1;
-    device_desc.gid = "00000000000000000000ffff7f000001";
-    segment_desc->devices.push_back(device_desc);
-
-    segment_desc->buffers.push_back(makeRdmaBufferDesc(addr));
-    return segment_desc;
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc> makeMemoryPoolSegmentDesc(
