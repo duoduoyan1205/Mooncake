@@ -119,16 +119,16 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
-
-  add_executable(memory_pool_transfer_engine_test
-                 ${WORKSPACE}/memory_pool_transfer_engine_test.cpp)
-  target_link_libraries(memory_pool_transfer_engine_test
-                        PUBLIC transfer_engine gtest gtest_main)
-  add_test(NAME memory_pool_transfer_engine_test
-           COMMAND memory_pool_transfer_engine_test)
-  set_tests_properties(memory_pool_transfer_engine_test
-                       PROPERTIES LABELS "memory_pool;mpu;sue;hardware")
 endif()
+
+add_executable(memory_pool_transfer_engine_test
+               ${WORKSPACE}/memory_pool_transfer_engine_test.cpp)
+target_link_libraries(memory_pool_transfer_engine_test
+                      PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME memory_pool_transfer_engine_test
+         COMMAND memory_pool_transfer_engine_test)
+set_tests_properties(memory_pool_transfer_engine_test
+                     PROPERTIES LABELS "memory_pool;mpu;sue;hardware")
 
 if(USE_UBSHMEM)
   add_executable(ubshmem_transport_test ${WORKSPACE}/ubshmem_transport_test.cpp)
@@ -139,8 +139,8 @@ endif()
 
 if(USE_EFA)
   add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
-  target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest
-                                                  gtest_main)
+  target_link_libraries(efa_transport_test PUBLIC transfer_engine gflags::gflags
+                                                  glog::glog)
   add_test(NAME efa_transport_test COMMAND efa_transport_test)
 
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
