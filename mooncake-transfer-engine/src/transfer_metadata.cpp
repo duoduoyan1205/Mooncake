@@ -965,6 +965,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
 	        }
 
 	        desc->buffers.push_back(buffer);
+	    }
     } else if (desc->protocol == "cxl") {
         desc->cxl_name = segmentJSON["cxl_name"].asString();
         desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
