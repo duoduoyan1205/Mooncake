@@ -1,17 +1,12 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
-add_subdirectory(common)
-add_subdirectory(transport)
-
-# EFA library path is set globally via common.cmake (LIBFABRIC_LIB_DIR)
-
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 # ---------------------------------------------------------------------------
 # AMDGPU-MPU userspace library
 # ---------------------------------------------------------------------------
 # The amdgpu-mpu project exports a small public userspace ABI consisting of
-# lib/libamdgpu_mpu.h and lib/libamdgpu-mpu.so. Keep the dependency explicit
-# and tied to the source tree used for local MPU development.
+# lib/libamdgpu_mpu.h and lib/libamdgpu-mpu.so. Resolve the dependency before
+# entering the transport subdirectories so their OBJECT targets can consume
+# the same include path.
 if(USE_MEMORY_POOL)
   set(AMDGPU_MPU_DIR "" CACHE PATH
       "Root directory of the amdgpu-mpu project")
@@ -28,7 +23,7 @@ if(USE_MEMORY_POOL)
   if(NOT EXISTS "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
     message(FATAL_ERROR
       "AMDGPU-MPU header not found: "
-      "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
+      "${AMDGPU_MPU_INCLUDE_DIR}/lib/libamdgpu_mpu.h")
   endif()
 
   if(NOT EXISTS "${AMDGPU_MPU_LIBRARY}")
@@ -37,6 +32,13 @@ if(USE_MEMORY_POOL)
       "${AMDGPU_MPU_LIBRARY}")
   endif()
 endif()
+
+add_subdirectory(common)
+add_subdirectory(transport)
+
+# EFA library path is set globally via common.cmake (LIBFABRIC_LIB_DIR)
+
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
@@ -116,7 +118,7 @@ endif()
 if(USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
   if(USE_CXI)
-    target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+    target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
   else()
     target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
   endif()
