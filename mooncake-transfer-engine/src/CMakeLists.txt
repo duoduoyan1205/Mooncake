@@ -1,4 +1,38 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
+
+# ---------------------------------------------------------------------------
+# AMDGPU-MPU userspace library
+# ---------------------------------------------------------------------------
+# The amdgpu-mpu project exports a small public userspace ABI consisting of
+# lib/libamdgpu_mpu.h and lib/libamdgpu-mpu.so. Resolve the dependency before
+# entering the transport subdirectories so their OBJECT targets can consume
+# the same include path.
+if(USE_MEMORY_POOL)
+  set(AMDGPU_MPU_DIR "" CACHE PATH
+      "Root directory of the amdgpu-mpu project")
+
+  if(NOT AMDGPU_MPU_DIR)
+    message(FATAL_ERROR
+      "USE_MEMORY_POOL=ON requires AMDGPU_MPU_DIR, "
+      "e.g. -DAMDGPU_MPU_DIR=/home/yanwei3/work/amdgpu-mpu")
+  endif()
+
+  set(AMDGPU_MPU_INCLUDE_DIR "${AMDGPU_MPU_DIR}/lib")
+  set(AMDGPU_MPU_LIBRARY "${AMDGPU_MPU_DIR}/lib/libamdgpu-mpu.so")
+
+  if(NOT EXISTS "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
+    message(FATAL_ERROR
+      "AMDGPU-MPU header not found: "
+      "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
+  endif()
+
+  if(NOT EXISTS "${AMDGPU_MPU_LIBRARY}")
+    message(FATAL_ERROR
+      "AMDGPU-MPU library not found: "
+      "${AMDGPU_MPU_LIBRARY}")
+  endif()
+endif()
+
 add_subdirectory(common)
 add_subdirectory(transport)
 
