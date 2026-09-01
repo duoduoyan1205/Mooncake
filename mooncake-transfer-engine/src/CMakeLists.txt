@@ -1,38 +1,4 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
-
-# ---------------------------------------------------------------------------
-# AMDGPU-MPU userspace library
-# ---------------------------------------------------------------------------
-# The amdgpu-mpu project exports a small public userspace ABI consisting of
-# lib/libamdgpu_mpu.h and lib/libamdgpu-mpu.so. Resolve the dependency before
-# entering the transport subdirectories so their OBJECT targets can consume
-# the same include path.
-if(USE_MEMORY_POOL)
-  set(AMDGPU_MPU_DIR "" CACHE PATH
-      "Root directory of the amdgpu-mpu project")
-
-  if(NOT AMDGPU_MPU_DIR)
-    message(FATAL_ERROR
-      "USE_MEMORY_POOL=ON requires AMDGPU_MPU_DIR, "
-      "e.g. -DAMDGPU_MPU_DIR=/home/yanwei3/work/amdgpu-mpu")
-  endif()
-
-  set(AMDGPU_MPU_INCLUDE_DIR "${AMDGPU_MPU_DIR}/lib")
-  set(AMDGPU_MPU_LIBRARY "${AMDGPU_MPU_DIR}/lib/libamdgpu-mpu.so")
-
-  if(NOT EXISTS "${AMDGPU_MPU_INCLUDE_DIR}/libamdgpu_mpu.h")
-    message(FATAL_ERROR
-      "AMDGPU-MPU header not found: "
-      "${AMDGPU_MPU_INCLUDE_DIR}/lib/libamdgpu_mpu.h")
-  endif()
-
-  if(NOT EXISTS "${AMDGPU_MPU_LIBRARY}")
-    message(FATAL_ERROR
-      "AMDGPU-MPU library not found: "
-      "${AMDGPU_MPU_LIBRARY}")
-  endif()
-endif()
-
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -105,7 +71,6 @@ target_link_libraries(
          glog::glog
          gflags::gflags
          pthread
-         dl
          JsonCpp::JsonCpp
          numa
          asio_shared
@@ -118,7 +83,7 @@ endif()
 if(USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
   if(USE_CXI)
-    target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
+    target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
   else()
     target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
   endif()
@@ -141,6 +106,7 @@ if(USE_MUSA)
 endif()
 
 if(USE_HYGON)
+  target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
   target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
 endif()
 
@@ -153,16 +119,27 @@ if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 
-  option(USE_HIP_DMABUF "Enable HIP dmabuf MR registration" ON)
+  # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
+  # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
+  option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)
   if(USE_HIP_DMABUF)
     find_package(hsa-runtime64 CONFIG)
     if(hsa-runtime64_FOUND)
+      # The dmabuf MR-registration code lives in rdma_context.cpp, which is
+      # compiled in the rdma_transport OBJECT library and pulled into
+      # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
+      # transfer_engine never reaches that object compilation, so the dmabuf
+      # path is silently compiled out and GPU MRs fall back to plain
+      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
+      # include/link usage requirements) on the target that actually compiles
+      # rdma_context.cpp.
       target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
       target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)
       target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
       message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
     else()
-      message(STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
+      message(
+        STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
     endif()
   else()
     message(STATUS "HIP dmabuf MR registration disabled (USE_HIP_DMABUF=OFF)")
@@ -174,7 +151,8 @@ if(USE_MLU)
 endif()
 
 if(USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
+                                               MPI::MPI)
 endif()
 
 if(USE_ASCEND_DIRECT)
@@ -186,7 +164,8 @@ if(USE_UBSHMEM)
 endif()
 
 if(USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  file(GLOB ASCEND_TOOLKIT_ROOT
+       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
