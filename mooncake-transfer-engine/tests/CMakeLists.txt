@@ -30,6 +30,8 @@ target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
+# Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
+# when no RDMA device is present, so safe to register with ctest.
 add_executable(endpoint_store_integration_test
                ${WORKSPACE}/endpoint_store_integration_test.cpp)
 target_link_libraries(endpoint_store_integration_test PUBLIC transfer_engine
@@ -48,6 +50,7 @@ target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
+# This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
                ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
 target_link_libraries(rdma_endpoint_reestablish_test PUBLIC transfer_engine
@@ -77,6 +80,7 @@ if(USE_NVMEOF)
   add_executable(nvmeof_transport_test ${WORKSPACE}/nvmeof_transport_test.cpp)
   target_link_libraries(nvmeof_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
+  # add_test(NAME nvmeof_transport_test COMMAND nvmeof_transport_test)
 endif()
 
 if(USE_TCP)
@@ -97,12 +101,18 @@ add_executable(tcp_address_validation_test
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
+# Hardware-free unit test for the active-connect circuit-breaker state
+# (ConnectPauseTracker is header-only and clock-injectable), runs on every CI
+# runner.
 add_executable(connect_pause_tracker_test
                ${WORKSPACE}/connect_pause_tracker_test.cpp)
 target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
                                                         pthread)
 add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
 
+# Hardware-free unit tests for DmabufExport struct and
+# RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner —
+# no RDMA device or GPU required (host-memory paths only).
 add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
@@ -119,16 +129,16 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
-endif()
 
-add_executable(memory_pool_transfer_engine_test
-               ${WORKSPACE}/memory_pool_transfer_engine_test.cpp)
-target_link_libraries(memory_pool_transfer_engine_test
-                      PUBLIC transfer_engine gtest gtest_main)
-add_test(NAME memory_pool_transfer_engine_test
-         COMMAND memory_pool_transfer_engine_test)
-set_tests_properties(memory_pool_transfer_engine_test
-                     PROPERTIES LABELS "memory_pool;mpu;sue;hardware")
+  add_executable(memory_pool_transfer_engine_test
+                 ${WORKSPACE}/memory_pool_transfer_engine_test.cpp)
+  target_link_libraries(memory_pool_transfer_engine_test
+                        PUBLIC transfer_engine gtest gtest_main)
+  add_test(NAME memory_pool_transfer_engine_test
+           COMMAND memory_pool_transfer_engine_test)
+  set_tests_properties(memory_pool_transfer_engine_test
+                       PROPERTIES LABELS "memory_pool;mpu;sue;hardware")
+endif()
 
 if(USE_UBSHMEM)
   add_executable(ubshmem_transport_test ${WORKSPACE}/ubshmem_transport_test.cpp)
@@ -139,8 +149,8 @@ endif()
 
 if(USE_EFA)
   add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
-  target_link_libraries(efa_transport_test PUBLIC transfer_engine gflags::gflags
-                                                  glog::glog)
+  target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
   add_test(NAME efa_transport_test COMMAND efa_transport_test)
 
   add_executable(efa_c_api_test ${WORKSPACE}/efa_c_api_test.cpp)
@@ -156,8 +166,16 @@ if(USE_EFA)
   target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags
                                                  glog::glog)
 
+  # GPU (CUDA device memory) loopback test — reproduces the EFA SHM intra-node
+  # segfault on FI_HMEM_CUDA buffers (ofiwg/libfabric#12328) and validates
+  # EfaContext::tryLoopbackCopy.  Needs CUDA headers/libs.
   if(USE_CUDA)
     add_executable(efa_gpu_loopback_test ${WORKSPACE}/efa_gpu_loopback_test.cpp)
+    # Resolve CUDA include dirs / runtime via CUDAToolkit instead of a hardcoded
+    # /usr/local/cuda/include, so the test builds wherever CUDA lives (e.g. the
+    # DLAMI pip venv layout).  find_package is idempotent and may not have run
+    # yet in this scope (top-level only calls it under WITH_EP), so request it
+    # here; fall back to the legacy path if the module variant is unavailable.
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
       target_include_directories(efa_gpu_loopback_test
@@ -188,11 +206,16 @@ if(USE_CXI)
   add_test(NAME cxi_unit_tests COMMAND cxi_unit_test)
 endif()
 
+# UB transport test with URMA endpoint and mock support
 if(USE_UB)
   add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
   target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest
                                                  gtest_main glog::glog pthread)
   target_include_directories(ub_transport_test PRIVATE ${urma_INCLUDE_DIR})
+  # Built but not registered with ctest: this test may still have race
+  # conditions and other stability issues, so keep it out of CI for now. Run
+  # manually with ./ub_transport_test. add_test(NAME ub_transport_test COMMAND
+  # ub_transport_test)
 endif()
 
 if(USE_SUNRISE)
@@ -293,16 +316,21 @@ target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
 if(USE_ASCEND_DIRECT)
+  # AscendDirectTransport unit test with mock implementations Mock
+  # implementations are included in the test file via anonymous namespace
   add_executable(ascend_direct_transport_test
                  ${WORKSPACE}/ascend_direct_transport_test.cpp)
   target_link_libraries(ascend_direct_transport_test
                         PUBLIC transfer_engine gtest gtest_main metadef)
+  # Allow shared library undefined symbols (Ascend libraries have circular deps)
   set_target_properties(ascend_direct_transport_test
                         PROPERTIES LINK_FLAGS "-Wl,--allow-shlib-undefined")
+
   add_test(NAME ascend_direct_transport_test
            COMMAND ascend_direct_transport_test)
 endif()
 
+# Multi-protocol transport test (only when ENABLE_MULTI_PROTOCOL is ON)
 if(ENABLE_MULTI_PROTOCOL)
   add_executable(mp_transport_test ${WORKSPACE}/mp_transport_test.cpp)
   target_link_libraries(mp_transport_test PUBLIC transfer_engine gtest
