@@ -129,7 +129,9 @@ if(USE_HIP)
   target_link_libraries(hip_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME hip_transport_test COMMAND hip_transport_test)
+endif()
 
+if(USE_MEMORY_POOL)
   add_executable(memory_pool_transfer_engine_test
                  ${WORKSPACE}/memory_pool_transfer_engine_test.cpp)
   target_link_libraries(memory_pool_transfer_engine_test
