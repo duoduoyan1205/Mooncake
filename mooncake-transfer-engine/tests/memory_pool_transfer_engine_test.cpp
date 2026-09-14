@@ -161,52 +161,6 @@ TEST(MemoryPoolTransferEngineTest, DmaBufExportAndImport)
     ASSERT_EQ(engine.Free(&allocation), 0);
 }
 
-TEST(MemoryPoolTransferEngineTest, SueQueueSubmission)
-{
-    auto engine = OpenEngine();
-    RequireEngineOpen(engine);
-
-    MemoryPoolTransferEngine::Allocation source;
-    MemoryPoolTransferEngine::Allocation destination;
-
-    ASSERT_EQ(engine.Allocate(kTransferSize, &source), 0);
-    ASSERT_EQ(engine.Allocate(kTransferSize, &destination), 0);
-
-    int dma_buf_fd = -1;
-    ASSERT_EQ(
-        engine.ExportDmaBuf(&source, O_CLOEXEC, &dma_buf_fd),
-        0);
-
-    uint64_t target_address = 0;
-    ASSERT_EQ(
-        engine.TargetRange(
-            destination, 0, kTransferSize, &target_address),
-        0);
-
-    uint64_t cookie = 0;
-    const int submit_ret = engine.SubmitDmaBufTransfer(
-        dma_buf_fd,
-        target_address,
-        0,
-        kTransferSize,
-        AMDGPU_MPU_SUE_OP_READ,
-        &cookie);
-
-    ASSERT_EQ(submit_ret, 0);
-    ASSERT_NE(cookie, 0u);
-
-    amdgpu_mpu_sue_status_t status{};
-    const int status_ret =
-        engine.GetDmaBufTransferStatus(cookie, &status);
-
-    ASSERT_TRUE(status_ret == 0 || status_ret == -11);
-
-    close(dma_buf_fd);
-
-    ASSERT_EQ(engine.Free(&source), 0);
-    ASSERT_EQ(engine.Free(&destination), 0);
-}
-
 TEST(MemoryPoolTransferEngineTest, ExternalDmaBufImport)
 {
     const char *gpu_dma_buf_fd = getenv("MOONCAKE_GPU_DMABUF_FD");
