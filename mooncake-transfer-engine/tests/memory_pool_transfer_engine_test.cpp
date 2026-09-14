@@ -3,8 +3,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <unistd.h>
@@ -16,7 +19,8 @@ using namespace mooncake;
 
 namespace {
 
-constexpr size_t kTransferSize = 2 * 1024 * 1024;
+constexpr uint64_t kPageSize = 4096;
+constexpr uint64_t kAllocationSize = 2 * 1024 * 1024;
 
 std::string EnvOrDefault(const char *name, const char *fallback)
 {
@@ -30,9 +34,12 @@ std::string EnvOrDefault(const char *name, const char *fallback)
 
 std::string GetDevicePaths()
 {
-    return EnvOrDefault(
-        "MOONCAKE_MEMORY_POOL_DEVICES",
-        EnvOrDefault("MOONCAKE_MEMORY_POOL_DEVICE", "/dev/amdgpu-mpu0").c_str());
+    const char *devices = getenv("MOONCAKE_MEMORY_POOL_DEVICES");
+    if (devices != nullptr && *devices != '\0') {
+        return std::string(devices);
+    }
+
+    return EnvOrDefault("MOONCAKE_MEMORY_POOL_DEVICE", "/dev/amdgpu-mpu0");
 }
 
 std::vector<std::string> SplitDevices(const std::string &devices)
@@ -56,11 +63,12 @@ std::vector<std::string> SplitDevices(const std::string &devices)
 
 MemoryPoolTransferEngine OpenEngine()
 {
+    // Retained for constructor compatibility. Passive-MPU tests do not use
+    // the MPU-initiated SUE submission path.
     const std::string sueverbs_library = EnvOrDefault(
         "MOONCAKE_SUEVERBS_LIBRARY", "libsueverbs.so");
-    const std::string device_paths = GetDevicePaths();
 
-    return MemoryPoolTransferEngine(sueverbs_library, device_paths);
+    return MemoryPoolTransferEngine(sueverbs_library, GetDevicePaths());
 }
 
 void RequireEngineOpen(MemoryPoolTransferEngine &engine)
@@ -69,8 +77,7 @@ void RequireEngineOpen(MemoryPoolTransferEngine &engine)
         GTEST_SKIP() << "No MPU devices configured";
     }
 
-    const std::vector<std::string> devices = SplitDevices(GetDevicePaths());
-    for (const std::string &device : devices) {
+    for (const std::string &device : SplitDevices(GetDevicePaths())) {
         if (access(device.c_str(), R_OK | W_OK) != 0) {
             GTEST_SKIP() << "MPU device unavailable: " << device;
         }
@@ -82,137 +89,235 @@ void RequireEngineOpen(MemoryPoolTransferEngine &engine)
     }
 
     ASSERT_TRUE(engine.IsOpen());
+    ASSERT_GT(engine.NodeCount(), 0u);
+    ASSERT_GT(engine.Capacity(), 0u);
+}
+
+void RequireValidAllocation(
+    const MemoryPoolTransferEngine::Allocation &allocation)
+{
+    ASSERT_TRUE(allocation.valid());
+    ASSERT_FALSE(allocation.mapped());
+}
+
+void TestExternalDmaBufImport(
+    MemoryPoolTransferEngine &engine,
+    const char *environment_name,
+    uint64_t expected_address,
+    MemoryPoolTransferEngine::DmaBufType type)
+{
+    const char *fd_string = getenv(environment_name);
+    if (fd_string == nullptr || *fd_string == '\0') {
+        GTEST_SKIP() << "Set " << environment_name
+                     << " to test external DMA-BUF import";
+    }
+
+    char *end = nullptr;
+    errno = 0;
+    const long parsed_fd = strtol(fd_string, &end, 10);
+
+    ASSERT_EQ(errno, 0);
+    ASSERT_NE(end, fd_string);
+    ASSERT_EQ(*end, '\0');
+    ASSERT_GE(parsed_fd, 0);
+    ASSERT_LE(parsed_fd, std::numeric_limits<int>::max());
+
+    MemoryPoolTransferEngine::ImportedDmaBuf imported;
+
+    ASSERT_EQ(
+        engine.ImportDmaBuf(
+            static_cast<int>(parsed_fd),
+            expected_address,
+            kAllocationSize,
+            type,
+            &imported),
+        0);
+
+    ASSERT_TRUE(imported.valid());
+    ASSERT_EQ(imported.length, kAllocationSize);
+    ASSERT_EQ(imported.address, expected_address);
+    ASSERT_EQ(imported.type, type);
+
+    ASSERT_EQ(engine.ReleaseDmaBuf(&imported), 0);
+    ASSERT_FALSE(imported.valid());
 }
 
 }  // namespace
 
-TEST(MemoryPoolTransferEngineTest, MultiNodeAllocationAndTargetRange)
+TEST(MemoryPoolTransferEngineTest, OpenAndDiscoverNodes)
 {
     auto engine = OpenEngine();
     RequireEngineOpen(engine);
 
-    ASSERT_GT(engine.Capacity(), 0u);
-
-    std::vector<MemoryPoolTransferEngine::Allocation> allocations;
-    allocations.reserve(engine.NodeCount() + 1);
-
-    for (size_t i = 0; i < engine.NodeCount() + 1; ++i) {
-        MemoryPoolTransferEngine::Allocation allocation;
-
-        ASSERT_EQ(engine.Allocate(kTransferSize, &allocation), 0);
-        ASSERT_TRUE(allocation.valid());
-
-        uint64_t target_address = 0;
-        ASSERT_EQ(
-            engine.TargetRange(
-                allocation, 0, kTransferSize, &target_address),
-            0);
-        ASSERT_NE(target_address, 0u);
-
-        allocations.push_back(std::move(allocation));
-    }
-
-    for (auto &allocation : allocations) {
-        ASSERT_EQ(engine.Free(&allocation), 0);
+    for (size_t node_id = 0; node_id < engine.NodeCount(); ++node_id) {
+        ASSERT_GT(engine.NodeCapacity(static_cast<uint32_t>(node_id)), 0u);
     }
 }
 
-TEST(MemoryPoolTransferEngineTest, DmaBufExportAndImport)
+TEST(MemoryPoolTransferEngineTest, AllocateTargetRangeAndFree)
 {
     auto engine = OpenEngine();
     RequireEngineOpen(engine);
 
     MemoryPoolTransferEngine::Allocation allocation;
-    ASSERT_EQ(engine.Allocate(kTransferSize, &allocation), 0);
+
+    ASSERT_EQ(engine.Allocate(kAllocationSize, &allocation), 0);
+    RequireValidAllocation(allocation);
+
+    uint64_t target_address = 0;
+    ASSERT_EQ(
+        engine.TargetRange(
+            allocation,
+            0,
+            kAllocationSize,
+            &target_address),
+        0);
+    ASSERT_NE(target_address, 0u);
+
+    ASSERT_EQ(engine.Free(&allocation), 0);
+    ASSERT_FALSE(allocation.valid());
+}
+
+TEST(MemoryPoolTransferEngineTest, AllocateSubrangesWithinOneAllocation)
+{
+    auto engine = OpenEngine();
+    RequireEngineOpen(engine);
+
+    MemoryPoolTransferEngine::Allocation allocation;
+    ASSERT_EQ(engine.Allocate(kAllocationSize, &allocation), 0);
+    RequireValidAllocation(allocation);
+
+    uint64_t first_address = 0;
+    uint64_t second_address = 0;
+
+    ASSERT_EQ(
+        engine.TargetRange(allocation, 0, kPageSize, &first_address),
+        0);
+    ASSERT_EQ(
+        engine.TargetRange(
+            allocation, kPageSize, kPageSize, &second_address),
+        0);
+
+    ASSERT_NE(first_address, 0u);
+    ASSERT_NE(second_address, 0u);
+    ASSERT_EQ(second_address - first_address, kPageSize);
+
+    ASSERT_EQ(engine.Free(&allocation), 0);
+}
+
+TEST(MemoryPoolTransferEngineTest, RejectInvalidTargetRanges)
+{
+    auto engine = OpenEngine();
+    RequireEngineOpen(engine);
+
+    MemoryPoolTransferEngine::Allocation allocation;
+    ASSERT_EQ(engine.Allocate(kAllocationSize, &allocation), 0);
+    RequireValidAllocation(allocation);
+
+    uint64_t target_address = 0;
+
+    ASSERT_NE(
+        engine.TargetRange(allocation, 0, 0, &target_address),
+        0);
+    ASSERT_NE(
+        engine.TargetRange(
+            allocation, kAllocationSize + 1, 1, &target_address),
+        0);
+    ASSERT_NE(
+        engine.TargetRange(
+            allocation, kAllocationSize - 1, 2, &target_address),
+        0);
+
+    ASSERT_EQ(engine.Free(&allocation), 0);
+}
+
+TEST(MemoryPoolTransferEngineTest, ExportMemoryPoolDmaBuf)
+{
+    auto engine = OpenEngine();
+    RequireEngineOpen(engine);
+
+    MemoryPoolTransferEngine::Allocation allocation;
+    ASSERT_EQ(engine.Allocate(kAllocationSize, &allocation), 0);
+    RequireValidAllocation(allocation);
 
     int dma_buf_fd = -1;
     ASSERT_EQ(
         engine.ExportDmaBuf(&allocation, O_CLOEXEC, &dma_buf_fd),
         0);
+    ASSERT_GE(dma_buf_fd, 0);
 
-    MemoryPoolTransferEngine::ImportedDmaBuf gpu_dma_buf;
-    MemoryPoolTransferEngine::ImportedDmaBuf nic_dma_buf;
-
-    ASSERT_EQ(
-        engine.ImportDmaBuf(
-            dma_buf_fd,
-            0x10000000,
-            kTransferSize,
-            MemoryPoolTransferEngine::DmaBufType::GPU,
-            &gpu_dma_buf),
-        0);
-
-    ASSERT_EQ(
-        engine.ImportDmaBuf(
-            dma_buf_fd,
-            0x20000000,
-            kTransferSize,
-            MemoryPoolTransferEngine::DmaBufType::NIC,
-            &nic_dma_buf),
-        0);
-
-    ASSERT_NE(gpu_dma_buf.fd, nic_dma_buf.fd);
-
-    ASSERT_EQ(engine.ReleaseDmaBuf(&gpu_dma_buf), 0);
-    ASSERT_EQ(engine.ReleaseDmaBuf(&nic_dma_buf), 0);
-
-    close(dma_buf_fd);
-
+    ASSERT_EQ(close(dma_buf_fd), 0);
     ASSERT_EQ(engine.Free(&allocation), 0);
 }
 
-TEST(MemoryPoolTransferEngineTest, ExternalDmaBufImport)
+TEST(MemoryPoolTransferEngineTest, ImportExportedDmaBufForGpuAndNic)
 {
-    const char *gpu_dma_buf_fd = getenv("MOONCAKE_GPU_DMABUF_FD");
-    const char *nic_dma_buf_fd = getenv("MOONCAKE_NIC_DMABUF_FD");
-
-    if (gpu_dma_buf_fd == nullptr && nic_dma_buf_fd == nullptr) {
-        GTEST_SKIP()
-            << "Set MOONCAKE_GPU_DMABUF_FD and/or "
-               "MOONCAKE_NIC_DMABUF_FD";
-    }
-
     auto engine = OpenEngine();
     RequireEngineOpen(engine);
 
-    std::vector<MemoryPoolTransferEngine::ImportedDmaBuf> imported_buffers;
+    MemoryPoolTransferEngine::Allocation allocation;
+    ASSERT_EQ(engine.Allocate(kAllocationSize, &allocation), 0);
+    RequireValidAllocation(allocation);
 
-    auto import_dma_buf = [&](const char *fd_string,
-                              uint64_t address,
-                              MemoryPoolTransferEngine::DmaBufType type) {
-        if (fd_string == nullptr) {
-            return;
-        }
+    int exported_fd = -1;
+    ASSERT_EQ(
+        engine.ExportDmaBuf(&allocation, O_CLOEXEC, &exported_fd),
+        0);
+    ASSERT_GE(exported_fd, 0);
 
-        char *end = nullptr;
-        const long fd = strtol(fd_string, &end, 10);
+    MemoryPoolTransferEngine::ImportedDmaBuf gpu_buffer;
+    MemoryPoolTransferEngine::ImportedDmaBuf nic_buffer;
 
-        ASSERT_TRUE(fd_string != end && *end == '\0');
+    ASSERT_EQ(
+        engine.ImportDmaBuf(
+            exported_fd,
+            0x10000000,
+            kAllocationSize,
+            MemoryPoolTransferEngine::DmaBufType::GPU,
+            &gpu_buffer),
+        0);
+    ASSERT_EQ(
+        engine.ImportDmaBuf(
+            exported_fd,
+            0x20000000,
+            kAllocationSize,
+            MemoryPoolTransferEngine::DmaBufType::NIC,
+            &nic_buffer),
+        0);
 
-        MemoryPoolTransferEngine::ImportedDmaBuf imported;
-        ASSERT_EQ(
-            engine.ImportDmaBuf(
-                static_cast<int>(fd),
-                address,
-                kTransferSize,
-                type,
-                &imported),
-            0);
+    ASSERT_TRUE(gpu_buffer.valid());
+    ASSERT_TRUE(nic_buffer.valid());
+    ASSERT_NE(gpu_buffer.fd, nic_buffer.fd);
 
-        imported_buffers.push_back(std::move(imported));
-    };
+    ASSERT_EQ(engine.ReleaseDmaBuf(&gpu_buffer), 0);
+    ASSERT_EQ(engine.ReleaseDmaBuf(&nic_buffer), 0);
+    ASSERT_FALSE(gpu_buffer.valid());
+    ASSERT_FALSE(nic_buffer.valid());
 
-    import_dma_buf(
-        gpu_dma_buf_fd,
+    ASSERT_EQ(close(exported_fd), 0);
+    ASSERT_EQ(engine.Free(&allocation), 0);
+}
+
+TEST(MemoryPoolTransferEngineTest, ImportExternalGpuDmaBuf)
+{
+    auto engine = OpenEngine();
+    RequireEngineOpen(engine);
+
+    TestExternalDmaBufImport(
+        engine,
+        "MOONCAKE_GPU_DMABUF_FD",
         0x30000000,
         MemoryPoolTransferEngine::DmaBufType::GPU);
+}
 
-    import_dma_buf(
-        nic_dma_buf_fd,
+TEST(MemoryPoolTransferEngineTest, ImportExternalNicDmaBuf)
+{
+    auto engine = OpenEngine();
+    RequireEngineOpen(engine);
+
+    TestExternalDmaBufImport(
+        engine,
+        "MOONCAKE_NIC_DMABUF_FD",
         0x40000000,
         MemoryPoolTransferEngine::DmaBufType::NIC);
-
-    for (auto &imported : imported_buffers) {
-        ASSERT_EQ(engine.ReleaseDmaBuf(&imported), 0);
-    }
 }
