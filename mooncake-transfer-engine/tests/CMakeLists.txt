@@ -132,18 +132,6 @@ if(USE_HIP)
 endif()
 
 if(USE_MEMORY_POOL)
-  add_executable(gpu_dmabuf_helper
-                 ${WORKSPACE}/helpers/gpu_dmabuf_helper.c)
-
-  target_link_libraries(gpu_dmabuf_helper
-                        PRIVATE
-                        amdgpu)
-  add_executable(nic_dmabuf_helper
-                 ${WORKSPACE}/helpers/nic_dmabuf_helper.c)
-
-  target_link_libraries(nic_dmabuf_helper
-                        PRIVATE
-                        ibverbs)
   add_executable(memory_pool_transfer_engine_test
                  ${WORKSPACE}/memory_pool_transfer_engine_test.cpp)
   target_link_libraries(memory_pool_transfer_engine_test
